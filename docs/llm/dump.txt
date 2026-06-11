@@ -1,6 +1,6 @@
 ===============================================================================
 ASP.NET PROJECT EXPORT  (git-tracked files only)
-Generated: 06/11/2026 13:56:09
+Generated: 06/11/2026 13:59:17
 Project Path: D:\DEV\personal\appointme
 ===============================================================================
 
@@ -813,6 +813,125 @@ MODIFIED: 06/11/2026 13:31:28
     "frontend-design@claude-plugins-official": true
   }
 }
+
+
+
+================================================================================
+FILE: .claude/skills/regenerate-api/SKILL.md
+SIZE: 5.6 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+---
+name: regenerate-api
+description: Regenerate the AppointMe frontend API client (orval/TanStack Query hooks + TypeScript schemas) after the backend OpenAPI surface changes. Use this whenever backend endpoints, request/response DTOs, or other contract-affecting types are added, removed, or modified — e.g. after editing files under src/AppointMe.Api, *Endpoint.cs, *Request.cs, *Response.cs, controllers, or anything that affects the OpenAPI JSON at https://localhost:7233/openapi/v1.json. The skill waits for the backend to be reachable, then runs `yarn generate:api` and reports the diff on src/api/.
+---
+
+# regenerate-api
+
+Regenerate `src/AppointMe.Frontend/src/api/appointme.ts` and `appointme.schemas.ts` from the live backend OpenAPI document. The frontend uses orval with `clean: true`, so the generated files are fully overwritten on each run.
+
+## When to use
+
+Invoke this skill after any change that alters the OpenAPI contract:
+- New / renamed / removed endpoint (`*Endpoint.cs`, anything implementing `IEndpoint`)
+- Changed request or response shape (`*Request.cs`, `*Response.cs`, DTOs)
+- Changed route, HTTP verb, status codes, or auth attributes on an endpoint
+- Changes to value objects exposed through DTOs (e.g. `PersonName`, `Email`)
+- Permission attribute changes that affect the generated metadata
+
+Do **not** invoke it for backend-only changes that don't touch the contract (internal handlers, domain events, EF config, migrations, tests).
+
+## Preconditions
+
+- Aspire (or at least the `AppointMe.Api` project) must be running and serving the new code.
+- The OpenAPI endpoint is `https://localhost:7233/openapi/v1.json` (self-signed cert, that's expected).
+- `yarn` is available in `src/AppointMe.Frontend/`.
+
+The orval script in `package.json` sets `NODE_TLS_REJECT_UNAUTHORIZED=0` for the self-signed cert — don't add `-k` flags anywhere else.
+
+## Procedure
+
+Run these steps in order. Do not skip the readiness check — running orval against a stale backend silently produces a stale client.
+
+### 1. Verify the backend is up and serving fresh code
+
+The backend must be **restarted** after the contract change for orval to see it. Aspire's default project setup does not hot-reload new endpoint signatures.
+
+Check reachability:
+
+```bash
+curl -k -s -o /dev/null -w "%{http_code}" https://localhost:7233/openapi/v1.json
+```
+
+Interpret:
+- `200` — backend is reachable. Continue, **but** verify with the user that they restarted the API since the contract change (or restart it yourself if you own the terminal). A reachable-but-stale backend is the #1 cause of confusing diffs from this skill.
+- `000` / connection refused — backend is not running. Stop and ask the user to start (or restart) Aspire:
+  ```
+  cd src/AppointMe.Aspire && dotnet run
+  ```
+  Or, if Aspire is already running, restart the `appointme-api` resource from the Aspire dashboard.
+
+### 2. Wait for the API to become ready
+
+Poll `/openapi/v1.json` until it returns 200, with a sane timeout (60s is enough for a warm restart; cold starts after `dotnet build` can take longer):
+
+```bash
+for i in $(seq 1 60); do
+  code=$(curl -k -s -o /dev/null -w "%{http_code}" https://localhost:7233/openapi/v1.json)
+  if [ "$code" = "200" ]; then echo "ready after ${i}s"; break; fi
+  sleep 1
+done
+```
+
+If it never reaches 200, stop and surface the user's Aspire logs — don't run orval.
+
+### 3. Capture the pre-state for a meaningful diff
+
+Before regeneration, note the current state of the generated files so you can show the user what changed:
+
+```bash
+cd src/AppointMe.Frontend
+git status --short src/api/
+```
+
+### 4. Run the generator
+
+```bash
+cd src/AppointMe.Frontend && yarn generate:api
+```
+
+Watch for:
+- Orval warnings about unresolved `$ref`s — usually indicates a backend serialization issue (a type missing `[JsonSerializable]` or a polymorphic type without a discriminator).
+- Prettier errors — the `afterAllFilesWrite` hook runs `prettier --write`; failure here means orval produced invalid output.
+
+### 5. Report the diff and follow-ups
+
+```bash
+cd src/AppointMe.Frontend && git diff --stat src/api/
+```
+
+Then check whether existing call sites still type-check against the new client:
+
+```bash
+cd src/AppointMe.Frontend && yarn tsc --noEmit --ignoreDeprecations 6.0
+```
+
+The `--ignoreDeprecations 6.0` flag is required — there's a pre-existing `baseUrl` deprecation in `tsconfig.json` that otherwise fails `tsc --noEmit` (see the frontend CLAUDE.md).
+
+If `tsc` reports errors, those are **call sites that need updating to match the new contract** — fix them in the same task; don't leave the codebase in a broken state.
+
+## Known pitfalls
+
+- **Stale reachable backend**: the most common failure mode. The endpoint responds 200, orval succeeds, but the OpenAPI doc still describes the old contract because the API process wasn't restarted. If the diff looks empty or doesn't reflect your edits, this is why — restart Aspire and rerun.
+- **Don't hand-edit `src/api/appointme.ts` or `src/api/appointme.schemas.ts`** — orval's `clean: true` mode deletes them on each run.
+- **Mutator path**: the generated client imports `apiClient` from `src/lib/axios.ts`. If you ever change that path, update `orval.config.ts` too.
+- **HTTPS cert**: dev uses mkcert via `vite-plugin-mkcert`. The `NODE_TLS_REJECT_UNAUTHORIZED=0` env in the `generate:api` script bypasses verification for orval's fetch — don't remove it.
+
+## Out of scope
+
+- This skill does not start, stop, or restart Aspire. The user owns that terminal.
+- This skill does not commit the regenerated files; report the diff and let the user/parent task decide.
 
 
 
@@ -1861,6 +1980,176 @@ EndGlobal
 
 
 ================================================================================
+FILE: CLAUDE.md
+SIZE: 8.79 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build and Development Commands
+
+### Running the Full Stack (Recommended)
+```bash
+cd src/AppointMe.Aspire && dotnet run
+```
+This starts all services via .NET Aspire: SQL Server, Azure Service Bus Emulator, Keycloak, Mailpit, API, and Frontend.
+
+### Backend Only
+```bash
+dotnet build AppointMe.sln        # Build entire solution
+dotnet run --project src/AppointMe.Api  # Run API
+```
+
+### Frontend Only
+```bash
+cd src/AppointMe.Frontend
+yarn install
+yarn dev          # Development server (port 5173)
+yarn build        # Production build
+yarn lint         # ESLint
+yarn generate:api # Regenerate API client from OpenAPI spec (see /regenerate-api skill)
+```
+
+### Regenerating the frontend API client after backend contract changes
+
+After any change that alters the OpenAPI surface — new/renamed/removed endpoint, changed `*Request.cs`/`*Response.cs` shape, changed route or HTTP verb, changed auth/permission attributes on an endpoint — invoke the `/regenerate-api` skill **in the same task**. It waits for the API to be reachable on `https://localhost:7233`, runs `yarn generate:api`, and reports the diff on `src/AppointMe.Frontend/src/api/`. The backend must be restarted (Aspire dashboard → restart `appointme-api`, or relaunch `dotnet run` in `src/AppointMe.Aspire`) so orval reads the new contract — a reachable-but-stale backend silently produces a stale client.
+
+Do **not** invoke `/regenerate-api` for backend-only changes that don't affect the contract (internal handlers, domain events, EF config, migrations, tests).
+
+### Testing
+```bash
+dotnet test                                    # All tests
+dotnet test src/CRM/AppointMe.Crm.Tests        # Single test project
+dotnet test --filter "FullyQualifiedName~TestName"  # Single test
+```
+
+## Architecture
+
+This is a **modular monolithic** .NET 10 application following Domain-Driven Design principles.
+
+### Module Structure
+```
+src/
+├── AppointMe.Api/           # ASP.NET Core API entry point
+├── AppointMe.Aspire/        # .NET Aspire orchestrator for local dev
+├── AppointMe.Shared/        # Shared domain abstractions and value objects
+├── Identity/AppointMe.Identity/           # User auth module (Keycloak)
+├── Organizations/AppointMe.Organizations/ # Companies & employees
+├── CRM/AppointMe.Crm/                     # Customer management
+├── Booking/AppointMe.Booking.Contracts/   # Booking contracts (TBD)
+└── AppointMe.Frontend/      # React/Vite/TypeScript frontend
+```
+
+### Key Patterns
+
+**Bounded Contexts**: Each module has its own `DbContext` with separate database schema:
+- `IdentityDbContext` (schema: "identity")
+- `OrganizationsDbContext` (schema: "organizations")
+- `CrmDbContext` (schema: "crm")
+
+**Vertical Slice Architecture**: Inside each module, code is organized by feature/use case rather than by technical layer. Each slice owns everything required to serve that use case and lives in its own folder named after the action (verb-first, CRUD-style for projections).
+
+Example layout:
+```
+Customers/
+├── Customer.cs                       # aggregate root
+├── CustomerId.cs
+├── RegisterCustomer/                 # one slice per use case
+│   ├── RegisterCustomer.cs           # domain factory (extension on aggregate)
+│   ├── RegisterCustomerCommand.cs
+│   ├── RegisterCustomerCommandHandler.cs
+│   ├── RegisterCustomerEndpoint.cs
+│   └── RegisterCustomerRequest.cs
+├── UpdateCustomer/
+├── DeleteCustomer/
+├── GetCustomers/                     # queries are slices too
+└── Database/                         # shared EF config / Dapper queries
+```
+
+Slice rules:
+- Event handlers live in the slice whose domain operation they invoke (e.g. `CustomerRegisteredEventHandler` sits in `CreateAttendee/` because it calls `Attendee.Create`), **not** in a shared `Handlers/` folder.
+- Domain operations on aggregates are expressed as extension methods co-located with the slice (`extension(Aggregate)` for factories, `extension(Aggregate instance)` for mutators) — see `RegisterCustomer.cs`, `UpdateCustomer.cs`, `DeleteCustomer.cs`.
+- Use CRUD-style verbs (`Create`, `Update`, `Delete`) for projection/synchronization slices, and domain-specific verbs (`Register`, `Schedule`, `Cancel`) for slices that own business intent on the source aggregate.
+- Shared infrastructure (EF type configurations, Dapper queries reused across slices, ID types, the aggregate itself) lives alongside the slices in the parent feature folder, not inside any one slice.
+
+**Endpoint Convention**: Implement `IEndpoint` interface. Endpoints are auto-discovered via Scrutor.
+
+**Module Registration**: Each module exposes extension methods:
+```csharp
+.AddIdentityModule()
+.AddCompaniesModule()
+.AddCrmModule()
+```
+
+**Domain Events**: Aggregate roots inherit from `AggregateRoot` and raise `IDomainEvent` events. Wolverine handles async messaging.
+
+**CQRS Pattern**:
+- Writes use Entity Framework Core
+- Reads use Dapper with `IDbConnectionFactory`
+
+**Authentication**: Hybrid auth scheme (JWT Bearer for API calls, Cookies for browser flows) with Keycloak.
+
+**Strongly-Typed IDs**: Each module defines its own ID types wrapping `Guid` (e.g. `CustomerId`, `EmployeeId`, `AttendeeId`, `ServiceProviderId`). Cross-module projections use module-local ID types, not source module IDs.
+
+**Value Objects**: Value objects like `PersonName`, `DateOfBirth`, `Email`, `LongString` live in `AppointMe.Shared/Domain/Common`. They expose two kinds of constructors:
+
+- The **primary constructor** (`new DateOfBirth(value)`, `new Email(value)`, `new PersonName(...)`) is unvalidated. Reserve it for trusted paths only — EF Core materialization via `HasConversion`, Dapper projections, and similar infrastructure code.
+- **Validating factories** live in a companion `…Factory` static class as extension methods on the value object's type. Always construct value objects from untrusted input (HTTP commands, event payloads from other modules, etc.) via these factories — never via the primary constructor.
+  - `Create(...)` — validates and throws `ValidationException` on invalid input.
+  - `CreateOrNull(...)` — returns `null` when the input is null, otherwise delegates to `Create`.
+
+Example (from `RegisterCustomerCommandHandler`):
+```csharp
+var customer = Customer.Register(
+    companyId: companyId,
+    name: PersonName.Create(command.FirstName, command.LastName),
+    dateOfBirth: DateOfBirth.CreateOrNull(command.DateOfBirth, timeProvider),
+    gender: Gender.ParseOrNull(command.Gender),
+    email: Email.CreateOrNull(command.Email),
+    registrationDate: timeProvider.GetUtcNow()
+);
+```
+
+The same rule applies inside event handlers that build projections from cross-module events — the payload is untrusted, so reconstruct value objects via `Create` / `CreateOrNull`, not `new`.
+
+**Permission Auto-Discovery**: Permissions are auto-discovered by assembly scanning. Define permissions as `public static readonly Permission` fields on static classes ending with `Permissions`. Register via `.AddPermissions(assembly)` which also auto-discovers `IDefaultGrantPolicy` implementations via Scrutor.
+
+### Naming Conventions
+
+**Async suffix**: In async-only APIs, asynchronous behavior is implicit; the `Async` suffix is used only to disambiguate from synchronous alternatives.
+
+**Lambda parameters**: Use full, descriptive names — not one- or two-letter abbreviations. Prefer `appointment => appointment.Id` over `a => a.Id`, `customer => customer.Name` over `c => c.Name`. Applies especially to EF `IEntityTypeConfiguration`, LINQ chains, and converter lambdas. Exceptions: single-char names are fine when the lambda is purely structural and the identifier carries no domain meaning (e.g. `x => x` in a trivial selector), but default to the full name.
+
+**Test methods**: Use `snake_case` with a `should_` or descriptive verb prefix that reads as a sentence describing the expected behavior. Test classes are non-sealed. Example:
+```csharp
+public class PermissionResolverTests
+{
+    [Fact]
+    public void should_deny_permission_when_any_role_denies() { ... }
+
+    [Fact]
+    public void should_return_empty_when_no_roles() { ... }
+}
+```
+
+### Tech Stack
+- **Backend**: .NET 10, C# 14, EF Core 10, Wolverine 5.9, Dapper
+- **Frontend**: React 19, TypeScript 5.8, Vite 7, Tailwind CSS 4, TanStack Query
+- **Infrastructure**: SQL Server 2022, Keycloak, Azure Service Bus Emulator
+
+## Local Development Services
+
+When running via Aspire:
+- **SQL Server**: localhost:60740 (sa/Password1)
+- **Keycloak**: http://localhost:8082 (admin/admin)
+- **Mailpit SMTP**: localhost:1026, Web UI: http://localhost:8026
+- **Frontend**: https://localhost:5173
+
+
+================================================================================
 FILE: compose.yaml
 SIZE: 3.2 KB
 MODIFIED: 06/11/2026 13:31:28
@@ -2076,7 +2365,7 @@ echo "Exported dev certificate to ${cert_dir}/keycloak.crt and keycloak.key"
 ================================================================================
 FILE: export.ps1
 SIZE: 8.91 KB
-MODIFIED: 06/11/2026 13:55:35
+MODIFIED: 06/11/2026 13:58:47
 ================================================================================
 
 #Requires -Version 7.0
@@ -2142,7 +2431,7 @@ $IncludeExtensions = @(
     "cs", "json", "xml", "csproj", "slnx", "sln", "config",
     "cshtml", "razor", "js", "css", "scss", "html",
     "yml", "yaml", "sql", "props", "targets", "sh",
-    "ps1"
+    "ps1", "md"
 )
 
 # Exact filenames (no extension match needed)
@@ -3712,6 +4001,211 @@ MODIFIED: 06/11/2026 13:31:28
 
 
 ================================================================================
+FILE: infra/README.md
+SIZE: 11.75 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# AppointMe — Azure devtest infrastructure
+
+Bicep modules that provision a single `devtest` environment for AppointMe.
+
+## What this provisions
+
+| Module                          | Resource                                                    |
+| ------------------------------- | ----------------------------------------------------------- |
+| `modules/log-analytics.bicep`   | Log Analytics workspace (PerGB2018, 30-day retention)       |
+| `modules/app-insights.bicep`    | Workspace-linked Application Insights                       |
+| `modules/key-vault.bicep`       | Key Vault (RBAC mode, standard tier, soft-delete on)        |
+| `modules/sql.bicep`             | Azure SQL Server + database (`S0`) + `Allow Azure services` firewall rule |
+| `modules/container-registry.bicep` | Azure Container Registry (Basic)                          |
+| `modules/storage.bicep`         | Storage Account + private blob container `data-protection-keys` |
+| `modules/service-bus.bicep`     | Service Bus namespace (Standard)                            |
+| `modules/app-service-plan.bicep` | Linux App Service Plan (B1)                                |
+| `modules/app-service.bicep`     | Web App for Containers + system-assigned managed identity + Key Vault references for secrets |
+| `modules/role-assignments.bicep` | `AcrPull` + `Key Vault Secrets User` on the App Service identity |
+
+## What this does NOT provision
+
+Outside the Bicep deliberately:
+
+- **Microsoft Entra External ID tenant**, user flows, and app registration. Tenant creation is portal-only; app registration on an existing tenant is doable via the Graph API but noisy in Bicep. See [Set up Entra External ID](#1-set-up-microsoft-entra-external-id) below.
+- **Keycloak** — local dev only. The app's `Authentication:Provider` config selects between `Keycloak` (local) and `EntraExternalId` (devtest/prod).
+- **Secrets in Key Vault** — the operator (or a follow-up script) seeds them after first deploy.
+- **Custom domain + DNS** — devtest uses the generated `*.azurewebsites.net` hostname.
+- **WAF, private endpoints, VNet integration, customer-managed keys** — production hardening, see [the prod-hardening checklist](#prod-hardening-checklist).
+- **Deployment slots** — requires Standard (S1) plan or higher; devtest runs B1.
+
+---
+
+## One-time setup
+
+### 1. Set up Microsoft Entra External ID
+
+1. Create an External ID tenant in the Azure portal: **Microsoft Entra ID → External ID → Create a new tenant**. Choose a subdomain `<tenant>.ciamlogin.com`.
+2. In the new tenant, **App registrations → New registration**:
+   - Name: `appointme-api-devtest`
+   - Supported account types: **Accounts in any organizational directory and personal Microsoft accounts** (or restricted, per your policy).
+   - Redirect URI (Web): `https://<your-app-service>.azurewebsites.net/signin-oidc` — leave blank for now if you haven't deployed yet; update after first deploy.
+3. **Authentication → Implicit grant and hybrid flows** — leave both off (we use authorization code flow).
+4. **Certificates & secrets → New client secret** — create one, copy the value immediately (paste into Key Vault in step 5).
+5. **Expose an API → Add a scope** — define a scope like `access_as_user`. Note the App ID URI (e.g. `api://<client-id>`) — this is your `ApiAudience`.
+6. **User flows → New user flow** — create a Sign-up and sign-in flow. Wire it to the app registration.
+
+You'll need these values for Bicep + Key Vault:
+
+| Value                          | Where it comes from                                |
+| ------------------------------ | -------------------------------------------------- |
+| `entraExternalIdAuthority`     | `https://<tenant>.ciamlogin.com/<tenantId>/v2.0`  |
+| `entraExternalIdClientId`      | App registration → Application (client) ID         |
+| `entraExternalIdApiAudience`   | Expose an API → Application ID URI                 |
+| `EntraExternalIdClientSecret`  | Certificates & secrets → secret value (Key Vault) |
+
+The non-secret identifiers (authority, client ID, API audience, tenant ID) go in `src/AppointMe.Api/appsettings.Devtest.json`. Copy the template and fill in your tenant's values:
+
+```bash
+cp src/AppointMe.Api/appsettings.Devtest.example.json src/AppointMe.Api/appsettings.Devtest.json
+```
+
+The **client secret is never committed** — it lives only in Key Vault (step 5) and is injected as the `Authentication__EntraExternalId__ClientSecret` app setting via a Key Vault reference.
+
+### 2. Bootstrap GitLab OIDC federated identity
+
+The GitLab pipeline (`.gitlab-ci.yml`) authenticates to Azure with OIDC federated credentials — no static client secrets in the repo or CI.
+
+```bash
+# Create a user-assigned managed identity for the CI deployer
+az identity create \
+  --name id-appointme-devtest-ci \
+  --resource-group rg-appointme-devtest
+
+# Subject claim restricts which pipeline can use the identity. Lock to the main branch.
+# GitLab's ID-token `sub` claim format is: project_path:<group>/<project>:ref_type:branch:ref:<branch>
+az identity federated-credential create \
+  --identity-name id-appointme-devtest-ci \
+  --resource-group rg-appointme-devtest \
+  --name gitlab-main \
+  --issuer https://gitlab.com \
+  --subject "project_path:bravo-dev/appointme:ref_type:branch:ref:main" \
+  --audiences api://AzureADTokenExchange
+```
+
+The `--audiences` value must match the `aud` requested in the `id_tokens` block of `.gitlab-ci.yml` (`api://AzureADTokenExchange`).
+
+Grant the identity the roles it needs to do its job:
+
+```bash
+PRINCIPAL_ID=$(az identity show -n id-appointme-devtest-ci -g rg-appointme-devtest --query principalId -o tsv)
+
+# Build images in ACR. `az acr build` runs a server-side ACR Task, which needs
+# control-plane access (read the registry + schedule the build run) — AcrPush is
+# data-plane only and is NOT sufficient. Contributor scoped to the single registry
+# covers it. (If you switch the pipeline to docker build + push, AcrPush is enough.)
+az role assignment create --assignee $PRINCIPAL_ID --role Contributor --scope $(az acr show -n <acr-name> -g rg-appointme-devtest --query id -o tsv)
+
+# Update the web app's container settings
+az role assignment create --assignee $PRINCIPAL_ID --role "Website Contributor" --scope $(az webapp show -n <web-app-name> -g rg-appointme-devtest --query id -o tsv)
+```
+
+### 3. GitLab CI/CD variables
+
+Add these under **Settings → CI/CD → Variables**. Mark them **Protected** (exposed only to protected branches/tags — make sure `main` is a protected branch), and **Masked** where the value allows:
+
+| Variable                | Value                                                        |
+| ----------------------- | ------------------------------------------------------------ |
+| `AZURE_CLIENT_ID`       | `clientId` of the user-assigned identity (`az identity show -n id-appointme-devtest-ci -g rg-appointme-devtest --query clientId -o tsv`) |
+| `AZURE_TENANT_ID`       | Your Azure tenant ID                                         |
+| `AZURE_SUBSCRIPTION_ID` | Subscription holding the devtest resource group              |
+| `AZURE_RESOURCE_GROUP`  | `rg-appointme-devtest`                                       |
+| `ACR_NAME`              | ACR name from Bicep output `containerRegistryName` (no `.azurecr.io`) |
+| `APP_SERVICE_NAME`      | Web App name from Bicep output (no URL, just the name)       |
+
+The pipeline derives the ACR login server as `$ACR_NAME.azurecr.io`, so no separate variable is needed for it.
+
+---
+
+## First deploy
+
+```bash
+# 1. Create the resource group
+az group create --name rg-appointme-devtest --location uksouth
+
+# 2. Provide secrets/params via env vars (do NOT commit real values)
+export SQL_ADMIN_PASSWORD='<a-strong-password>'
+export ENTRA_AUTHORITY='https://<tenant>.ciamlogin.com/<tenantId>/v2.0'
+export ENTRA_CLIENT_ID='<client-id>'
+export ENTRA_API_AUDIENCE='api://<client-id>'
+export HANGFIRE_ADMINS='you@example.com,colleague@example.com'
+
+# 3. Preview the plan
+az deployment group what-if \
+  --resource-group rg-appointme-devtest \
+  --template-file infra/main.bicep \
+  --parameters infra/main.bicepparam
+
+# 4. Apply
+az deployment group create \
+  --resource-group rg-appointme-devtest \
+  --template-file infra/main.bicep \
+  --parameters infra/main.bicepparam \
+  --query 'properties.outputs'
+```
+
+The first deploy uses `mcr.microsoft.com/azuredocs/aci-helloworld:latest` as a placeholder so App Service can start before any AppointMe image exists. CI replaces the image on the next `main` push.
+
+## Seed Key Vault
+
+The App Service reads secrets via Key Vault references. Populate these secret names after the first deploy:
+
+| Secret name                    | How to populate                                                                                          |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `AppointMeSql`                 | Full SQL connection string: `Server=tcp:<server>.database.windows.net,1433;Initial Catalog=appointme;User ID=<login>;Password=<password>;Encrypt=True;TrustServerCertificate=False;` |
+| `AppointMeMessaging`           | `az servicebus namespace authorization-rule keys list --resource-group rg-appointme-devtest --namespace-name <sb-name> --name RootManageSharedAccessKey --query primaryConnectionString -o tsv` |
+| `DataProtectionStorage`        | `az storage account show-connection-string --resource-group rg-appointme-devtest --name <storage-name> --query connectionString -o tsv` |
+| `EntraExternalIdClientSecret`  | Client secret value from the External ID app registration (step 1.4)                                     |
+
+Example seeding:
+
+```bash
+KV=$(az deployment group show -g rg-appointme-devtest -n main --query 'properties.outputs.keyVaultName.value' -o tsv)
+
+az keyvault secret set --vault-name "$KV" --name AppointMeSql --value "..."
+az keyvault secret set --vault-name "$KV" --name AppointMeMessaging --value "..."
+az keyvault secret set --vault-name "$KV" --name DataProtectionStorage --value "..."
+az keyvault secret set --vault-name "$KV" --name EntraExternalIdClientSecret --value "..."
+
+# Restart the App Service so it picks up Key Vault references
+az webapp restart --name <app-service-name> --resource-group rg-appointme-devtest
+```
+
+After the restart, EF migrations run on container startup before the API starts serving.
+
+## Wolverine in Azure
+
+`Wolverine:Transport=AzureServiceBus` is set in App Service settings. Wolverine auto-provisions queues based on the message types it discovers in the assembly (`.AutoProvision()` in `WolverineHostBuilderExtensions.cs`). No manual queue creation is required for devtest.
+
+The SQL outbox is still active — Service Bus is the wire transport, SQL is the durability layer.
+
+## Prod-hardening checklist
+
+When promoting beyond devtest:
+
+- [ ] App Service Plan → S1 or P1v3 for deployment slots and zone-redundancy
+- [ ] Azure SQL → Entra-only auth (drop the SQL login + password), enable Microsoft Defender for SQL, tune backup retention
+- [ ] Private endpoints for SQL, Storage, Service Bus, Key Vault, ACR
+- [ ] VNet integration for the App Service
+- [ ] WAF (Azure Front Door or App Gateway) in front of the App Service
+- [ ] Customer-managed keys for Storage and Key Vault
+- [ ] Custom domain + managed TLS
+- [ ] Multi-region: Front Door + paired-region App Service + SQL geo-replication
+- [ ] Tighten SQL firewall — remove "Allow Azure services" once VNet/private endpoints land
+- [ ] Replace the Hangfire dashboard email allow-list with a role/permission integration once roles are projected into JWT claims
+- [ ] Set Key Vault `enablePurgeProtection: true`
+- [ ] Storage account `allowSharedKeyAccess: false` — switch Data Protection to managed identity blob access
+
+
+
+================================================================================
 FILE: NuGet.config
 SIZE: 0.39 KB
 MODIFIED: 06/11/2026 13:31:28
@@ -3729,6 +4223,202 @@ MODIFIED: 06/11/2026 13:31:28
     </packageSource>
   </packageSourceMapping>
 </configuration>
+
+
+================================================================================
+FILE: README.md
+SIZE: 10.27 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# AppointMe
+
+A production-grade **SaaS starter template** for advanced .NET teams, solo founders, and agencies who want a real foundation.
+
+AppointMe is a modular monolith (.NET 10 + React 19) with the hard parts already solved: multi-tenancy, authentication, authorization, CQRS, domain events, durable messaging, and a typed frontend wired to the backend contract. Clone it, press F5, and you have a running multi-tenant app — then build your product on top.
+
+## What's inside
+
+- **Modular monolith** — Identity, Organizations, CRM, and Booking, each a bounded context with its own `DbContext` and schema, organized by vertical slice.
+- **Auth done properly** — Keycloak (OIDC) with a hybrid scheme: JWT Bearer for the API, cookies for browser flows. Sign-up, email verification, and password reset included.
+- **Multi-tenancy** — company resolution via header/claim with EF Core query filters, so tenant isolation is enforced at the data layer.
+- **CQRS + DDD** — writes through EF Core aggregates and domain events; reads through Dapper. Async messaging via Wolverine with a durable SQL transport.
+- **Permission system** — auto-discovered, role-based permissions with default grant policies.
+- **Typed frontend** — React 19 + Vite 7 + Tailwind 4, TanStack Query hooks and TypeScript types generated directly from the backend OpenAPI spec (orval).
+- **One-command local stack** — .NET Aspire orchestrates SQL Server, Keycloak, Mailpit, the API, and the frontend, with database migrations applied and demo data seeded automatically. Prefer to skip Aspire? A matching `compose.yaml` runs the same backing services so you can launch the API and frontend yourself.
+
+## Quick start
+
+Goal: clone the repo and have AppointMe running locally — backend, frontend, database, auth, and mail.
+
+You choose how the backing services (SQL Server, Keycloak, Mailpit) run:
+
+- **Option A — .NET Aspire** *(recommended)*: one command starts everything, including the API and frontend. Zero manual wiring.
+- **Option B — Docker Compose**: brings up only the backing services on the same ports; you run the API and frontend yourself. Pick this if you'd rather not depend on the Aspire host, or want the dependencies running independently of your debugger.
+
+Both produce an identical running app — same images, ports, credentials, and seeded data. Do the [prerequisites](#prerequisites) once, then follow either option.
+
+### Prerequisites
+
+| Requirement | Why | Notes |
+|---|---|---|
+| [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) | Builds and runs the API and the Aspire host | `dotnet --version` should report `10.x` |
+| [Docker](https://www.docker.com/products/docker-desktop/) (running) | Hosts SQL Server, Keycloak, and Mailpit containers | Docker Desktop or any OCI-compatible runtime |
+| [Node.js 22+](https://nodejs.org/) & [Yarn](https://yarnpkg.com/) | Builds and serves the React frontend | `corepack enable` gives you Yarn |
+| HTTPS dev certificate | Frontend and services run over HTTPS | `dotnet dev-certs https --trust` |
+
+> First run pulls container images and restores NuGet/Yarn packages, so it takes a few minutes. Subsequent runs are fast — the SQL Server, Keycloak, and Mailpit containers are persistent and reused across restarts.
+
+### Clone and trust the dev cert
+
+Both options start here:
+
+```bash
+git clone <your-fork-or-clone-url> appointme
+cd appointme
+
+# One-time: trust the local HTTPS dev cert (used by the API, frontend, and Keycloak)
+dotnet dev-certs https --trust
+```
+
+### Option A — .NET Aspire
+
+```bash
+# Start the whole stack — backing services, API, and frontend
+cd src/AppointMe.Aspire
+dotnet run
+```
+
+**Prefer your IDE?** Open `AppointMe.sln` in Visual Studio or Rider, set **`AppointMe.Aspire`** as the startup project, and press **F5**. That's the entire setup.
+
+Either way, the [.NET Aspire dashboard](https://learn.microsoft.com/dotnet/aspire/fundamentals/dashboard/overview) opens automatically. Wait for every resource to turn **Running** (green) — the API waits for SQL Server and Keycloak to be healthy before it starts.
+
+What happens on startup, with no action from you:
+
+- SQL Server, Keycloak, and Mailpit containers come up.
+- The `appointme` Keycloak realm (clients, roles, mappers) is imported.
+- EF Core migrations are applied to every module's schema.
+- Demo customers and appointments are seeded (Development only).
+- The API starts, then the Vite frontend.
+
+### Option B — Docker Compose
+
+Compose runs only the backing services (SQL Server, Keycloak, Mailpit) — on the same ports, images, and credentials as Aspire. You run the API and frontend yourself.
+
+```bash
+# 1. One-time: export the trusted dev cert that Keycloak serves on https://localhost:8082
+./docker/keycloak/export-dev-cert.sh
+#    (Windows / no bash — run the command the script wraps:)
+#    dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
+
+# 2. Start the backing services and wait for them to report healthy
+docker compose up -d
+docker compose ps          # SQL Server and Keycloak should show "healthy"
+
+# 3. Run the API (applies migrations + seeds demo data on first start)
+dotnet run --project src/AppointMe.Api
+
+# 4. In a second terminal, run the frontend
+cd src/AppointMe.Frontend
+yarn install
+yarn dev
+```
+
+Then open **https://localhost:5173**. To stop the services, `docker compose stop` (keeps data) or `docker compose down` (removes the containers; SQL Server and Keycloak data survive in named volumes — add `-v` to wipe them too).
+
+What Compose does for you:
+
+- SQL Server, Keycloak, and Mailpit containers come up with health checks.
+- Keycloak serves HTTPS on `8082` using your trusted dev cert and imports the `appointme` realm.
+- SQL Server and Keycloak data persist in named volumes across restarts.
+
+EF Core migrations and demo-data seeding happen when **you** start the API in step 3 (same as Aspire — the API does this on startup, not Compose).
+
+### Where everything lives
+
+| Service | URL | Credentials |
+|---|---|---|
+| **Frontend (the app)** | https://localhost:5173 | sign up — see below |
+| Aspire dashboard | shown in the console at startup | — |
+| Keycloak admin console | https://localhost:8082 | `admin` / `admin` |
+| Mailpit (catches all outgoing email) | http://localhost:8026 | — |
+| API OpenAPI document | https://localhost:7233/openapi/v1.json | — |
+| SQL Server | `localhost:60740` | `sa` / `Password1` |
+
+> **About these credentials.** Every secret used in local development — the SQL `sa` password, the Keycloak `admin` account, and the Keycloak client secrets in `appsettings.Development.json` and `appointme-realm.json` — is a throwaway default. It only protects containers running on your machine, and it's committed on purpose so the stack runs with zero setup. These are safe to keep in a public repo, but **never reuse them in a real deployment**. Production secrets live in Azure Key Vault and are injected at deploy time — see [`infra/`](./infra). A `gitleaks` workflow scans every push/PR to catch any *real* secret that slips in.
+
+### Create your first account
+
+The app manages its own sign-up — you don't register through Keycloak directly.
+
+1. Open **https://localhost:5173** and go to **Sign up** (`/auth/signup`).
+2. Submit the form. AppointMe provisions your user in Keycloak and sends a verification email.
+3. Open **Mailpit at http://localhost:8026**, find the verification email, and click the link. (No real mail is sent — Mailpit catches everything locally.)
+4. Log in with your new credentials.
+5. Complete **onboarding** to create your company. You now have a fully working, multi-tenant AppointMe instance with demo data to explore.
+
+That's it — you're up and running.
+
+## Project layout
+
+```
+src/
+├── AppointMe.Aspire/        # .NET Aspire orchestrator — the F5 entry point for local dev
+├── AppointMe.Api/           # ASP.NET Core API host (endpoints auto-discovered)
+├── AppointMe.Shared/        # Shared domain abstractions, value objects, infrastructure
+├── Identity/                # Authentication & user provisioning (Keycloak)
+├── Organizations/           # Companies, employees, invitations, onboarding
+├── CRM/                     # Customer management
+├── Booking/                 # Appointments & scheduling
+└── AppointMe.Frontend/      # React + Vite + TypeScript SPA
+```
+
+The codebase follows Domain-Driven Design with **vertical slice architecture** — each use case owns its command, handler, endpoint, and request/response in a single folder. For the full architecture guide, conventions, and patterns, see [`CLAUDE.md`](./CLAUDE.md).
+
+## Common commands
+
+```bash
+# Full stack (recommended) — from src/AppointMe.Aspire
+dotnet run
+
+# Backing services only, without Aspire (see Quick start → Option B)
+docker compose up -d        # start SQL Server, Keycloak, Mailpit
+docker compose ps           # check health
+docker compose down         # stop and remove containers (data volumes persist)
+
+# Backend only
+dotnet build AppointMe.sln
+dotnet run --project src/AppointMe.Api
+
+# Tests
+dotnet test                                          # everything
+dotnet test --filter "FullyQualifiedName~TestName"   # a single test
+
+# Frontend — from src/AppointMe.Frontend
+yarn install
+yarn dev            # dev server on https://localhost:5173
+yarn build          # production build
+yarn lint           # ESLint
+yarn generate:api   # regenerate the typed API client from the backend OpenAPI spec
+```
+
+> When you change the backend contract (endpoints, request/response shapes, routes, or auth attributes), restart the API and run `yarn generate:api` to keep the frontend's typed client in sync.
+
+## Tech stack
+
+- **Backend:** .NET 10, C# 14, EF Core 10, Wolverine 5.9, Dapper
+- **Frontend:** React 19, TypeScript 5.8, Vite 7, Tailwind CSS 4, TanStack Query
+- **Infrastructure:** SQL Server 2022/2025, Keycloak, Azure Service Bus emulator, orchestrated with .NET Aspire
+
+## License
+
+AppointMe is released under the [MIT License](./LICENSE) — free to use, modify, and
+distribute, including commercially.
+
+It builds on open-source libraries that remain under their own licenses. See
+[`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md) for attribution and a note on
+Hangfire (LGPL-3.0).
+
 
 
 ================================================================================
@@ -8948,6 +9638,509 @@ interface:
 
 
 ================================================================================
+FILE: src/AppointMe.Frontend/.agents/skills/shadcn/cli.md
+SIZE: 16.31 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# shadcn CLI Reference
+
+Configuration is read from `components.json`.
+
+> **IMPORTANT:** Always run commands using the project's package runner: `npx shadcn@latest`, `pnpm dlx shadcn@latest`, or `bunx --bun shadcn@latest`. Check `packageManager` from project context to choose the right one. Examples below use `npx shadcn@latest` but substitute the correct runner for the project.
+
+> **IMPORTANT:** Only use the flags documented below. Do not invent or guess flags — if a flag isn't listed here, it doesn't exist. The CLI auto-detects the package manager from the project's lockfile; there is no `--package-manager` flag.
+
+## Contents
+
+- Commands: init, apply, add (dry-run, smart merge), search, view, docs, info, build
+- Templates: next, vite, start, react-router, astro
+- Presets: named, code, URL formats and fields
+- Switching presets
+
+---
+
+## Commands
+
+### `init` — Initialize or create a project
+
+```bash
+npx shadcn@latest init [components...] [options]
+```
+
+Initializes shadcn/ui in an existing project or creates a new project (when `--name` is provided). Optionally installs components in the same step.
+
+| Flag                    | Short | Description                                               | Default |
+| ----------------------- | ----- | --------------------------------------------------------- | ------- |
+| `--template <template>` | `-t`  | Template (next, start, vite, next-monorepo, react-router) | —       |
+| `--preset [name]`       | `-p`  | Preset configuration (named, code, or URL)                | —       |
+| `--yes`                 | `-y`  | Skip confirmation prompt                                  | `true`  |
+| `--defaults`            | `-d`  | Use defaults (`--template=next --preset=base-nova`)       | `false` |
+| `--force`               | `-f`  | Force overwrite existing configuration                    | `false` |
+| `--cwd <cwd>`           | `-c`  | Working directory                                         | current |
+| `--name <name>`         | `-n`  | Name for new project                                      | —       |
+| `--silent`              | `-s`  | Mute output                                               | `false` |
+| `--rtl`                 |       | Enable RTL support                                        | —       |
+| `--reinstall`           |       | Re-install existing UI components                         | `false` |
+| `--monorepo`            |       | Scaffold a monorepo project                               | —       |
+| `--no-monorepo`         |       | Skip the monorepo prompt                                  | —       |
+
+`npx shadcn@latest create` is an alias for `npx shadcn@latest init`.
+
+### `apply` — Apply a preset to an existing project
+
+```bash
+npx shadcn@latest apply [preset] [options]
+```
+
+Applies a preset to an existing project, overwriting preset-driven config, fonts, CSS variables, and detected UI components.
+
+| Flag                | Short | Description                                | Default |
+| ------------------- | ----- | ------------------------------------------ | ------- |
+| `--preset <preset>` | —     | Preset configuration (named, code, or URL) | —       |
+| `--yes`             | `-y`  | Skip confirmation prompt                   | `false` |
+| `--cwd <cwd>`       | `-c`  | Working directory                          | current |
+| `--silent`          | `-s`  | Mute output                                | `false` |
+
+`[preset]` is a shorthand for `--preset <preset>`. If both are provided, they must match.
+If no preset is provided, the CLI offers to open the custom preset builder on `ui.shadcn.com/create`.
+
+### `add` — Add components
+
+> **IMPORTANT:** To compare local components against upstream or to preview changes, ALWAYS use `npx shadcn@latest add <component> --dry-run`, `--diff`, or `--view`. NEVER fetch raw files from GitHub or other sources manually. The CLI handles registry resolution, file paths, and CSS diffing automatically.
+
+```bash
+npx shadcn@latest add [components...] [options]
+```
+
+Accepts component names, registry-prefixed names (`@magicui/shimmer-button`), URLs, or local paths.
+
+| Flag            | Short | Description                                                                                                          | Default |
+| --------------- | ----- | -------------------------------------------------------------------------------------------------------------------- | ------- |
+| `--yes`         | `-y`  | Skip confirmation prompt                                                                                             | `false` |
+| `--overwrite`   | `-o`  | Overwrite existing files                                                                                             | `false` |
+| `--cwd <cwd>`   | `-c`  | Working directory                                                                                                    | current |
+| `--all`         | `-a`  | Add all available components                                                                                         | `false` |
+| `--path <path>` | `-p`  | Target path for the component                                                                                        | —       |
+| `--silent`      | `-s`  | Mute output                                                                                                          | `false` |
+| `--dry-run`     |       | Preview all changes without writing files                                                                            | `false` |
+| `--diff [path]` |       | Show diffs. Without a path, shows the first 5 files. With a path, shows that file only (implies `--dry-run`)         | —       |
+| `--view [path]` |       | Show file contents. Without a path, shows the first 5 files. With a path, shows that file only (implies `--dry-run`) | —       |
+
+#### Dry-Run Mode
+
+Use `--dry-run` to preview what `add` would do without writing any files. `--diff` and `--view` both imply `--dry-run`.
+
+```bash
+# Preview all changes.
+npx shadcn@latest add button --dry-run
+
+# Show diffs for all files (top 5).
+npx shadcn@latest add button --diff
+
+# Show the diff for a specific file.
+npx shadcn@latest add button --diff button.tsx
+
+# Show contents for all files (top 5).
+npx shadcn@latest add button --view
+
+# Show the full content of a specific file.
+npx shadcn@latest add button --view button.tsx
+
+# Works with URLs too.
+npx shadcn@latest add https://api.npoint.io/abc123 --dry-run
+
+# CSS diffs.
+npx shadcn@latest add button --diff globals.css
+```
+
+**When to use dry-run:**
+
+- When the user asks "what files will this add?" or "what will this change?" — use `--dry-run`.
+- Before overwriting existing components — use `--diff` to preview the changes first.
+- When the user wants to inspect component source code without installing — use `--view`.
+- When checking what CSS changes would be made to `globals.css` — use `--diff globals.css`.
+- When the user asks to review or audit third-party registry code before installing — use `--view` to inspect the source.
+
+> **`npx shadcn@latest add --dry-run` vs `npx shadcn@latest view`:** Prefer `npx shadcn@latest add --dry-run/--diff/--view` over `npx shadcn@latest view` when the user wants to preview changes to their project. `npx shadcn@latest view` only shows raw registry metadata. `npx shadcn@latest add --dry-run` shows exactly what would happen in the user's project: resolved file paths, diffs against existing files, and CSS updates. Use `npx shadcn@latest view` only when the user wants to browse registry info without a project context.
+
+#### Smart Merge from Upstream
+
+See [Updating Components in SKILL.md](./SKILL.md#updating-components) for the full workflow.
+
+### `search` — Search registries
+
+```bash
+npx shadcn@latest search <registries...> [options]
+```
+
+Fuzzy search across registries. Also aliased as `npx shadcn@latest list`. Without `-q`, lists all items.
+
+| Flag                | Short | Description            | Default |
+| ------------------- | ----- | ---------------------- | ------- |
+| `--query <query>`   | `-q`  | Search query           | —       |
+| `--limit <number>`  | `-l`  | Max items per registry | `100`   |
+| `--offset <number>` | `-o`  | Items to skip          | `0`     |
+| `--cwd <cwd>`       | `-c`  | Working directory      | current |
+
+### `view` — View item details
+
+```bash
+npx shadcn@latest view <items...> [options]
+```
+
+Displays item info including file contents. Example: `npx shadcn@latest view @shadcn/button`.
+
+### `docs` — Get component documentation URLs
+
+```bash
+npx shadcn@latest docs <components...> [options]
+```
+
+Outputs resolved URLs for component documentation, examples, and API references. Accepts one or more component names. Fetch the URLs to get the actual content.
+
+Example output for `npx shadcn@latest docs input button`:
+
+```
+base  radix
+
+input
+  docs      https://ui.shadcn.com/docs/components/radix/input
+  examples  https://raw.githubusercontent.com/.../examples/input-example.tsx
+
+button
+  docs      https://ui.shadcn.com/docs/components/radix/button
+  examples  https://raw.githubusercontent.com/.../examples/button-example.tsx
+```
+
+Some components include an `api` link to the underlying library (e.g. `cmdk` for the command component).
+
+### `diff` — Check for updates
+
+Do not use this command. Use `npx shadcn@latest add --diff` instead.
+
+### `info` — Project information
+
+```bash
+npx shadcn@latest info [options]
+```
+
+Displays project info and `components.json` configuration. Run this first to discover the project's framework, aliases, Tailwind version, and resolved paths.
+
+| Flag          | Short | Description       | Default |
+| ------------- | ----- | ----------------- | ------- |
+| `--cwd <cwd>` | `-c`  | Working directory | current |
+
+**Project Info fields:**
+
+| Field                | Type      | Meaning                                                            |
+| -------------------- | --------- | ------------------------------------------------------------------ |
+| `framework`          | `string`  | Detected framework (`next`, `vite`, `react-router`, `start`, etc.) |
+| `frameworkVersion`   | `string`  | Framework version (e.g. `15.2.4`)                                  |
+| `isSrcDir`           | `boolean` | Whether the project uses a `src/` directory                        |
+| `isRSC`              | `boolean` | Whether React Server Components are enabled                        |
+| `isTsx`              | `boolean` | Whether the project uses TypeScript                                |
+| `tailwindVersion`    | `string`  | `"v3"` or `"v4"`                                                   |
+| `tailwindConfigFile` | `string`  | Path to the Tailwind config file                                   |
+| `tailwindCssFile`    | `string`  | Path to the global CSS file                                        |
+| `aliasPrefix`        | `string`  | Import alias prefix (e.g. `@`, `~`, `@/`)                          |
+| `packageManager`     | `string`  | Detected package manager (`npm`, `pnpm`, `yarn`, `bun`)            |
+
+**Components.json fields:**
+
+| Field                | Type      | Meaning                                                                                    |
+| -------------------- | --------- | ------------------------------------------------------------------------------------------ |
+| `base`               | `string`  | Primitive library (`radix` or `base`) — determines component APIs and available props      |
+| `style`              | `string`  | Visual style (e.g. `nova`, `vega`)                                                         |
+| `rsc`                | `boolean` | RSC flag from config                                                                       |
+| `tsx`                | `boolean` | TypeScript flag                                                                            |
+| `tailwind.config`    | `string`  | Tailwind config path                                                                       |
+| `tailwind.css`       | `string`  | Global CSS path — this is where custom CSS variables go                                    |
+| `iconLibrary`        | `string`  | Icon library — determines icon import package (e.g. `lucide-react`, `@tabler/icons-react`) |
+| `aliases.components` | `string`  | Component import alias (e.g. `@/components`)                                               |
+| `aliases.utils`      | `string`  | Utils import alias (e.g. `@/lib/utils`)                                                    |
+| `aliases.ui`         | `string`  | UI component alias (e.g. `@/components/ui`)                                                |
+| `aliases.lib`        | `string`  | Lib alias (e.g. `@/lib`)                                                                   |
+| `aliases.hooks`      | `string`  | Hooks alias (e.g. `@/hooks`)                                                               |
+| `resolvedPaths`      | `object`  | Absolute file-system paths for each alias                                                  |
+| `registries`         | `object`  | Configured custom registries                                                               |
+
+**Links fields:**
+
+The `info` output includes a **Links** section with templated URLs for component docs, source, and examples. For resolved URLs, use `npx shadcn@latest docs <component>` instead.
+
+### `build` — Build a custom registry
+
+```bash
+npx shadcn@latest build [registry] [options]
+```
+
+Builds `registry.json` into individual JSON files for distribution. Default input: `./registry.json`, default output: `./public/r`.
+
+| Flag              | Short | Description       | Default      |
+| ----------------- | ----- | ----------------- | ------------ |
+| `--output <path>` | `-o`  | Output directory  | `./public/r` |
+| `--cwd <cwd>`     | `-c`  | Working directory | current      |
+
+---
+
+## Templates
+
+| Value          | Framework      | Monorepo support |
+| -------------- | -------------- | ---------------- |
+| `next`         | Next.js        | Yes              |
+| `vite`         | Vite           | Yes              |
+| `start`        | TanStack Start | Yes              |
+| `react-router` | React Router   | Yes              |
+| `astro`        | Astro          | Yes              |
+| `laravel`      | Laravel        | No               |
+
+All templates support monorepo scaffolding via the `--monorepo` flag. When passed, the CLI uses a monorepo-specific template directory (e.g. `next-monorepo`, `vite-monorepo`). When neither `--monorepo` nor `--no-monorepo` is passed, the CLI prompts interactively. Laravel does not support monorepo scaffolding.
+
+---
+
+## Presets
+
+Three ways to specify a preset via `--preset`:
+
+1. **Named:** `--preset nova` or `--preset lyra`
+2. **Code:** `--preset a2r6bw` (version-prefixed base62 string, e.g. `a2r6bw` or `b0`)
+3. **URL:** `--preset "https://ui.shadcn.com/init?base=radix&style=nova&..."`
+
+> **IMPORTANT:** Never try to decode, fetch, or resolve preset codes manually. Preset codes are opaque — pass them directly to `npx shadcn@latest init --preset <code>` and let the CLI handle resolution.
+> Use `npx shadcn@latest apply --preset <code>` when overwriting an existing project's preset.
+
+## Switching Presets
+
+Ask the user first: **overwrite**, **merge**, or **skip** existing components?
+
+- **Overwrite / Re-install** → `npx shadcn@latest apply --preset <code>`. Overwrites all detected component files with the new preset styles. Use when the user hasn't customized components.
+- **Merge** → `npx shadcn@latest init --preset <code> --force --no-reinstall`, then run `npx shadcn@latest info` to get the list of installed components and use the [smart merge workflow](./SKILL.md#updating-components) to update them one by one, preserving local changes. Use when the user has customized components.
+- **Skip** → `npx shadcn@latest init --preset <code> --force --no-reinstall`. Only updates config and CSS variables, leaves existing components as-is.
+
+Always run preset commands inside the user's project directory. `apply` only works in an existing project with a `components.json` file. The CLI automatically preserves the current base (`base` vs `radix`) from `components.json`. If you must use a scratch/temp directory (e.g. for `--dry-run` comparisons), pass `--base <current-base>` explicitly — preset codes do not encode the base.
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.agents/skills/shadcn/customization.md
+SIZE: 6.14 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Customization & Theming
+
+Components reference semantic CSS variable tokens. Change the variables to change every component.
+
+## Contents
+
+- How it works (CSS variables → Tailwind utilities → components)
+- Color variables and OKLCH format
+- Dark mode setup
+- Changing the theme (presets, CSS variables)
+- Adding custom colors (Tailwind v3 and v4)
+- Border radius
+- Customizing components (variants, className, wrappers)
+- Checking for updates
+
+---
+
+## How It Works
+
+1. CSS variables defined in `:root` (light) and `.dark` (dark mode).
+2. Tailwind maps them to utilities: `bg-primary`, `text-muted-foreground`, etc.
+3. Components use these utilities — changing a variable changes all components that reference it.
+
+---
+
+## Color Variables
+
+Every color follows the `name` / `name-foreground` convention. The base variable is for backgrounds, `-foreground` is for text/icons on that background.
+
+| Variable                                     | Purpose                          |
+| -------------------------------------------- | -------------------------------- |
+| `--background` / `--foreground`              | Page background and default text |
+| `--card` / `--card-foreground`               | Card surfaces                    |
+| `--primary` / `--primary-foreground`         | Primary buttons and actions      |
+| `--secondary` / `--secondary-foreground`     | Secondary actions                |
+| `--muted` / `--muted-foreground`             | Muted/disabled states            |
+| `--accent` / `--accent-foreground`           | Hover and accent states          |
+| `--destructive` / `--destructive-foreground` | Error and destructive actions    |
+| `--border`                                   | Default border color             |
+| `--input`                                    | Form input borders               |
+| `--ring`                                     | Focus ring color                 |
+| `--chart-1` through `--chart-5`              | Chart/data visualization         |
+| `--sidebar-*`                                | Sidebar-specific colors          |
+| `--surface` / `--surface-foreground`         | Secondary surface                |
+
+Colors use OKLCH: `--primary: oklch(0.205 0 0)` where values are lightness (0–1), chroma (0 = gray), and hue (0–360).
+
+---
+
+## Dark Mode
+
+Class-based toggle via `.dark` on the root element. In Next.js, use `next-themes`:
+
+```tsx
+import { ThemeProvider } from "next-themes"
+
+<ThemeProvider attribute="class" defaultTheme="system" enableSystem>
+  {children}
+</ThemeProvider>
+```
+
+---
+
+## Changing the Theme
+
+```bash
+# Apply a preset code from ui.shadcn.com.
+npx shadcn@latest apply --preset a2r6bw
+
+# Positional shorthand also works.
+npx shadcn@latest apply a2r6bw
+
+# Switch to a named preset and overwrite existing components.
+npx shadcn@latest apply --preset nova
+
+# Preserve existing components instead.
+npx shadcn@latest init --preset nova --force --no-reinstall
+
+# Use a custom theme URL.
+npx shadcn@latest apply --preset "https://ui.shadcn.com/init?base=radix&style=nova&theme=blue&..."
+```
+
+Or edit CSS variables directly in `globals.css`.
+
+---
+
+## Adding Custom Colors
+
+Add variables to the file at `tailwindCssFile` from `npx shadcn@latest info` (typically `globals.css`). Never create a new CSS file for this.
+
+```css
+/* 1. Define in the global CSS file. */
+:root {
+  --warning: oklch(0.84 0.16 84);
+  --warning-foreground: oklch(0.28 0.07 46);
+}
+.dark {
+  --warning: oklch(0.41 0.11 46);
+  --warning-foreground: oklch(0.99 0.02 95);
+}
+```
+
+```css
+/* 2a. Register with Tailwind v4 (@theme inline). */
+@theme inline {
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+}
+```
+
+When `tailwindVersion` is `"v3"` (check via `npx shadcn@latest info`), register in `tailwind.config.js` instead:
+
+```js
+// 2b. Register with Tailwind v3 (tailwind.config.js).
+module.exports = {
+  theme: {
+    extend: {
+      colors: {
+        warning: "oklch(var(--warning) / <alpha-value>)",
+        "warning-foreground":
+          "oklch(var(--warning-foreground) / <alpha-value>)",
+      },
+    },
+  },
+}
+```
+
+```tsx
+// 3. Use in components.
+<div className="bg-warning text-warning-foreground">Warning</div>
+```
+
+---
+
+## Border Radius
+
+`--radius` controls border radius globally. Components derive values from it (`rounded-lg` = `var(--radius)`, `rounded-md` = `calc(var(--radius) - 2px)`).
+
+---
+
+## Customizing Components
+
+See also: [rules/styling.md](./rules/styling.md) for Incorrect/Correct examples.
+
+Prefer these approaches in order:
+
+### 1. Built-in variants
+
+```tsx
+<Button variant="outline" size="sm">
+  Click
+</Button>
+```
+
+### 2. Tailwind classes via `className`
+
+```tsx
+<Card className="mx-auto max-w-md">...</Card>
+```
+
+### 3. Add a new variant
+
+Edit the component source to add a variant via `cva`:
+
+```tsx
+// components/ui/button.tsx
+warning: "bg-warning text-warning-foreground hover:bg-warning/90",
+```
+
+### 4. Wrapper components
+
+Compose shadcn/ui primitives into higher-level components:
+
+```tsx
+export function ConfirmDialog({ title, description, onConfirm, children }) {
+  return (
+    <AlertDialog>
+      <AlertDialogTrigger asChild>{children}</AlertDialogTrigger>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{title}</AlertDialogTitle>
+          <AlertDialogDescription>{description}</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={onConfirm}>Confirm</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+```
+
+---
+
+## Checking for Updates
+
+```bash
+npx shadcn@latest add button --diff
+```
+
+To preview exactly what would change before updating, use `--dry-run` and `--diff`:
+
+```bash
+npx shadcn@latest add button --dry-run        # see all affected files
+npx shadcn@latest add button --diff button.tsx # see the diff for a specific file
+```
+
+See [Updating Components in SKILL.md](./SKILL.md#updating-components) for the full smart merge workflow.
+
+
+
+================================================================================
 FILE: src/AppointMe.Frontend/.agents/skills/shadcn/evals/evals.json
 SIZE: 3.09 KB
 MODIFIED: 06/11/2026 13:31:28
@@ -9004,6 +10197,1365 @@ MODIFIED: 06/11/2026 13:31:28
 
 
 ================================================================================
+FILE: src/AppointMe.Frontend/.agents/skills/shadcn/mcp.md
+SIZE: 2.42 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# shadcn MCP Server
+
+The CLI includes an MCP server that lets AI assistants search, browse, view, and install components from registries.
+
+---
+
+## Setup
+
+```bash
+shadcn mcp        # start the MCP server (stdio)
+shadcn mcp init   # write config for your editor
+```
+
+Editor config files:
+
+| Editor | Config file |
+|--------|------------|
+| Claude Code | `.mcp.json` |
+| Cursor | `.cursor/mcp.json` |
+| VS Code | `.vscode/mcp.json` |
+| OpenCode | `opencode.json` |
+| Codex | `~/.codex/config.toml` (manual) |
+
+---
+
+## Tools
+
+> **Tip:** MCP tools handle registry operations (search, view, install). For project configuration (aliases, framework, Tailwind version), use `npx shadcn@latest info` — there is no MCP equivalent.
+
+### `shadcn:get_project_registries`
+
+Returns registry names from `components.json`. Errors if no `components.json` exists.
+
+**Input:** none
+
+### `shadcn:list_items_in_registries`
+
+Lists all items from one or more registries.
+
+**Input:** `registries` (string[]), `limit` (number, optional), `offset` (number, optional)
+
+### `shadcn:search_items_in_registries`
+
+Fuzzy search across registries.
+
+**Input:** `registries` (string[]), `query` (string), `limit` (number, optional), `offset` (number, optional)
+
+### `shadcn:view_items_in_registries`
+
+View item details including full file contents.
+
+**Input:** `items` (string[]) — e.g. `["@shadcn/button", "@shadcn/card"]`
+
+### `shadcn:get_item_examples_from_registries`
+
+Find usage examples and demos with source code.
+
+**Input:** `registries` (string[]), `query` (string) — e.g. `"accordion-demo"`, `"button example"`
+
+### `shadcn:get_add_command_for_items`
+
+Returns the CLI install command.
+
+**Input:** `items` (string[]) — e.g. `["@shadcn/button"]`
+
+### `shadcn:get_audit_checklist`
+
+Returns a checklist for verifying components (imports, deps, lint, TypeScript).
+
+**Input:** none
+
+---
+
+## Configuring Registries
+
+Registries are set in `components.json`. The `@shadcn` registry is always built-in.
+
+```json
+{
+  "registries": {
+    "@acme": "https://acme.com/r/{name}.json",
+    "@private": {
+      "url": "https://private.com/r/{name}.json",
+      "headers": { "Authorization": "Bearer ${MY_TOKEN}" }
+    }
+  }
+}
+```
+
+- Names must start with `@`.
+- URLs must contain `{name}`.
+- `${VAR}` references are resolved from environment variables.
+
+Community registry index: `https://ui.shadcn.com/r/registries.json`
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.agents/skills/shadcn/rules/base-vs-radix.md
+SIZE: 7.09 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Base vs Radix
+
+API differences between `base` and `radix`. Check the `base` field from `npx shadcn@latest info`.
+
+## Contents
+
+- Composition: asChild vs render
+- Button / trigger as non-button element
+- Select (items prop, placeholder, positioning, multiple, object values)
+- ToggleGroup (type vs multiple)
+- Slider (scalar vs array)
+- Accordion (type and defaultValue)
+
+---
+
+## Composition: asChild (radix) vs render (base)
+
+Radix uses `asChild` to replace the default element. Base uses `render`. Don't wrap triggers in extra elements.
+
+**Incorrect:**
+
+```tsx
+<DialogTrigger>
+  <div>
+    <Button>Open</Button>
+  </div>
+</DialogTrigger>
+```
+
+**Correct (radix):**
+
+```tsx
+<DialogTrigger asChild>
+  <Button>Open</Button>
+</DialogTrigger>
+```
+
+**Correct (base):**
+
+```tsx
+<DialogTrigger render={<Button />}>Open</DialogTrigger>
+```
+
+This applies to all trigger and close components: `DialogTrigger`, `SheetTrigger`, `AlertDialogTrigger`, `DropdownMenuTrigger`, `PopoverTrigger`, `TooltipTrigger`, `CollapsibleTrigger`, `DialogClose`, `SheetClose`, `NavigationMenuLink`, `BreadcrumbLink`, `SidebarMenuButton`, `Badge`, `Item`.
+
+---
+
+## Button / trigger as non-button element (base only)
+
+When `render` changes an element to a non-button (`<a>`, `<span>`), add `nativeButton={false}`.
+
+**Incorrect (base):** missing `nativeButton={false}`.
+
+```tsx
+<Button render={<a href="/docs" />}>Read the docs</Button>
+```
+
+**Correct (base):**
+
+```tsx
+<Button render={<a href="/docs" />} nativeButton={false}>
+  Read the docs
+</Button>
+```
+
+**Correct (radix):**
+
+```tsx
+<Button asChild>
+  <a href="/docs">Read the docs</a>
+</Button>
+```
+
+Same for triggers whose `render` is not a `Button`:
+
+```tsx
+// base.
+<PopoverTrigger render={<InputGroupAddon />} nativeButton={false}>
+  Pick date
+</PopoverTrigger>
+```
+
+---
+
+## Select
+
+**items prop (base only).** Base requires an `items` prop on the root. Radix uses inline JSX only.
+
+**Incorrect (base):**
+
+```tsx
+<Select>
+  <SelectTrigger><SelectValue placeholder="Select a fruit" /></SelectTrigger>
+</Select>
+```
+
+**Correct (base):**
+
+```tsx
+const items = [
+  { label: "Select a fruit", value: null },
+  { label: "Apple", value: "apple" },
+  { label: "Banana", value: "banana" },
+]
+
+<Select items={items}>
+  <SelectTrigger>
+    <SelectValue />
+  </SelectTrigger>
+  <SelectContent>
+    <SelectGroup>
+      {items.map((item) => (
+        <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+      ))}
+    </SelectGroup>
+  </SelectContent>
+</Select>
+```
+
+**Correct (radix):**
+
+```tsx
+<Select>
+  <SelectTrigger>
+    <SelectValue placeholder="Select a fruit" />
+  </SelectTrigger>
+  <SelectContent>
+    <SelectGroup>
+      <SelectItem value="apple">Apple</SelectItem>
+      <SelectItem value="banana">Banana</SelectItem>
+    </SelectGroup>
+  </SelectContent>
+</Select>
+```
+
+**Placeholder.** Base uses a `{ value: null }` item in the items array. Radix uses `<SelectValue placeholder="...">`.
+
+**Content positioning.** Base uses `alignItemWithTrigger`. Radix uses `position`.
+
+```tsx
+// base.
+<SelectContent alignItemWithTrigger={false} side="bottom">
+
+// radix.
+<SelectContent position="popper">
+```
+
+---
+
+## Select — multiple selection and object values (base only)
+
+Base supports `multiple`, render-function children on `SelectValue`, and object values with `itemToStringValue`. Radix is single-select with string values only.
+
+**Correct (base — multiple selection):**
+
+```tsx
+<Select items={items} multiple defaultValue={[]}>
+  <SelectTrigger>
+    <SelectValue>
+      {(value: string[]) => value.length === 0 ? "Select fruits" : `${value.length} selected`}
+    </SelectValue>
+  </SelectTrigger>
+  ...
+</Select>
+```
+
+**Correct (base — object values):**
+
+```tsx
+<Select defaultValue={plans[0]} itemToStringValue={(plan) => plan.name}>
+  <SelectTrigger>
+    <SelectValue>{(value) => value.name}</SelectValue>
+  </SelectTrigger>
+  ...
+</Select>
+```
+
+---
+
+## ToggleGroup
+
+Base uses a `multiple` boolean prop. Radix uses `type="single"` or `type="multiple"`.
+
+**Incorrect (base):**
+
+```tsx
+<ToggleGroup type="single" defaultValue="daily">
+  <ToggleGroupItem value="daily">Daily</ToggleGroupItem>
+</ToggleGroup>
+```
+
+**Correct (base):**
+
+```tsx
+// Single (no prop needed), defaultValue is always an array.
+<ToggleGroup defaultValue={["daily"]} spacing={2}>
+  <ToggleGroupItem value="daily">Daily</ToggleGroupItem>
+  <ToggleGroupItem value="weekly">Weekly</ToggleGroupItem>
+</ToggleGroup>
+
+// Multi-selection.
+<ToggleGroup multiple>
+  <ToggleGroupItem value="bold">Bold</ToggleGroupItem>
+  <ToggleGroupItem value="italic">Italic</ToggleGroupItem>
+</ToggleGroup>
+```
+
+**Correct (radix):**
+
+```tsx
+// Single, defaultValue is a string.
+<ToggleGroup type="single" defaultValue="daily" spacing={2}>
+  <ToggleGroupItem value="daily">Daily</ToggleGroupItem>
+  <ToggleGroupItem value="weekly">Weekly</ToggleGroupItem>
+</ToggleGroup>
+
+// Multi-selection.
+<ToggleGroup type="multiple">
+  <ToggleGroupItem value="bold">Bold</ToggleGroupItem>
+  <ToggleGroupItem value="italic">Italic</ToggleGroupItem>
+</ToggleGroup>
+```
+
+**Controlled single value:**
+
+```tsx
+// base — wrap/unwrap arrays.
+const [value, setValue] = React.useState("normal")
+<ToggleGroup value={[value]} onValueChange={(v) => setValue(v[0])}>
+
+// radix — plain string.
+const [value, setValue] = React.useState("normal")
+<ToggleGroup type="single" value={value} onValueChange={setValue}>
+```
+
+---
+
+## Slider
+
+Base accepts a plain number for a single thumb. Radix always requires an array.
+
+**Incorrect (base):**
+
+```tsx
+<Slider defaultValue={[50]} max={100} step={1} />
+```
+
+**Correct (base):**
+
+```tsx
+<Slider defaultValue={50} max={100} step={1} />
+```
+
+**Correct (radix):**
+
+```tsx
+<Slider defaultValue={[50]} max={100} step={1} />
+```
+
+Both use arrays for range sliders. Controlled `onValueChange` in base may need a cast:
+
+```tsx
+// base.
+const [value, setValue] = React.useState([0.3, 0.7])
+<Slider value={value} onValueChange={(v) => setValue(v as number[])} />
+
+// radix.
+const [value, setValue] = React.useState([0.3, 0.7])
+<Slider value={value} onValueChange={setValue} />
+```
+
+---
+
+## Accordion
+
+Radix requires `type="single"` or `type="multiple"` and supports `collapsible`. `defaultValue` is a string. Base uses no `type` prop, uses `multiple` boolean, and `defaultValue` is always an array.
+
+**Incorrect (base):**
+
+```tsx
+<Accordion type="single" collapsible defaultValue="item-1">
+  <AccordionItem value="item-1">...</AccordionItem>
+</Accordion>
+```
+
+**Correct (base):**
+
+```tsx
+<Accordion defaultValue={["item-1"]}>
+  <AccordionItem value="item-1">...</AccordionItem>
+</Accordion>
+
+// Multi-select.
+<Accordion multiple defaultValue={["item-1", "item-2"]}>
+  <AccordionItem value="item-1">...</AccordionItem>
+  <AccordionItem value="item-2">...</AccordionItem>
+</Accordion>
+```
+
+**Correct (radix):**
+
+```tsx
+<Accordion type="single" collapsible defaultValue="item-1">
+  <AccordionItem value="item-1">...</AccordionItem>
+</Accordion>
+```
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.agents/skills/shadcn/rules/composition.md
+SIZE: 4.36 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Component Composition
+
+## Contents
+
+- Items always inside their Group component
+- Callouts use Alert
+- Empty states use Empty component
+- Toast notifications use sonner
+- Choosing between overlay components
+- Dialog, Sheet, and Drawer always need a Title
+- Card structure
+- Button has no isPending or isLoading prop
+- TabsTrigger must be inside TabsList
+- Avatar always needs AvatarFallback
+- Use Separator instead of raw hr or border divs
+- Use Skeleton for loading placeholders
+- Use Badge instead of custom styled spans
+
+---
+
+## Items always inside their Group component
+
+Never render items directly inside the content container.
+
+**Incorrect:**
+
+```tsx
+<SelectContent>
+  <SelectItem value="apple">Apple</SelectItem>
+  <SelectItem value="banana">Banana</SelectItem>
+</SelectContent>
+```
+
+**Correct:**
+
+```tsx
+<SelectContent>
+  <SelectGroup>
+    <SelectItem value="apple">Apple</SelectItem>
+    <SelectItem value="banana">Banana</SelectItem>
+  </SelectGroup>
+</SelectContent>
+```
+
+This applies to all group-based components:
+
+| Item | Group |
+|------|-------|
+| `SelectItem`, `SelectLabel` | `SelectGroup` |
+| `DropdownMenuItem`, `DropdownMenuLabel`, `DropdownMenuSub` | `DropdownMenuGroup` |
+| `MenubarItem` | `MenubarGroup` |
+| `ContextMenuItem` | `ContextMenuGroup` |
+| `CommandItem` | `CommandGroup` |
+
+---
+
+## Callouts use Alert
+
+```tsx
+<Alert>
+  <AlertTitle>Warning</AlertTitle>
+  <AlertDescription>Something needs attention.</AlertDescription>
+</Alert>
+```
+
+---
+
+## Empty states use Empty component
+
+```tsx
+<Empty>
+  <EmptyHeader>
+    <EmptyMedia variant="icon"><FolderIcon /></EmptyMedia>
+    <EmptyTitle>No projects yet</EmptyTitle>
+    <EmptyDescription>Get started by creating a new project.</EmptyDescription>
+  </EmptyHeader>
+  <EmptyContent>
+    <Button>Create Project</Button>
+  </EmptyContent>
+</Empty>
+```
+
+---
+
+## Toast notifications use sonner
+
+```tsx
+import { toast } from "sonner"
+
+toast.success("Changes saved.")
+toast.error("Something went wrong.")
+toast("File deleted.", {
+  action: { label: "Undo", onClick: () => undoDelete() },
+})
+```
+
+---
+
+## Choosing between overlay components
+
+| Use case | Component |
+|----------|-----------|
+| Focused task that requires input | `Dialog` |
+| Destructive action confirmation | `AlertDialog` |
+| Side panel with details or filters | `Sheet` |
+| Mobile-first bottom panel | `Drawer` |
+| Quick info on hover | `HoverCard` |
+| Small contextual content on click | `Popover` |
+
+---
+
+## Dialog, Sheet, and Drawer always need a Title
+
+`DialogTitle`, `SheetTitle`, `DrawerTitle` are required for accessibility. Use `className="sr-only"` if visually hidden.
+
+```tsx
+<DialogContent>
+  <DialogHeader>
+    <DialogTitle>Edit Profile</DialogTitle>
+    <DialogDescription>Update your profile.</DialogDescription>
+  </DialogHeader>
+  ...
+</DialogContent>
+```
+
+---
+
+## Card structure
+
+Use full composition — don't dump everything into `CardContent`:
+
+```tsx
+<Card>
+  <CardHeader>
+    <CardTitle>Team Members</CardTitle>
+    <CardDescription>Manage your team.</CardDescription>
+  </CardHeader>
+  <CardContent>...</CardContent>
+  <CardFooter>
+    <Button>Invite</Button>
+  </CardFooter>
+</Card>
+```
+
+---
+
+## Button has no isPending or isLoading prop
+
+Compose with `Spinner` + `data-icon` + `disabled`:
+
+```tsx
+<Button disabled>
+  <Spinner data-icon="inline-start" />
+  Saving...
+</Button>
+```
+
+---
+
+## TabsTrigger must be inside TabsList
+
+Never render `TabsTrigger` directly inside `Tabs` — always wrap in `TabsList`:
+
+```tsx
+<Tabs defaultValue="account">
+  <TabsList>
+    <TabsTrigger value="account">Account</TabsTrigger>
+    <TabsTrigger value="password">Password</TabsTrigger>
+  </TabsList>
+  <TabsContent value="account">...</TabsContent>
+</Tabs>
+```
+
+---
+
+## Avatar always needs AvatarFallback
+
+Always include `AvatarFallback` for when the image fails to load:
+
+```tsx
+<Avatar>
+  <AvatarImage src="/avatar.png" alt="User" />
+  <AvatarFallback>JD</AvatarFallback>
+</Avatar>
+```
+
+---
+
+## Use existing components instead of custom markup
+
+| Instead of | Use |
+|---|---|
+| `<hr>` or `<div className="border-t">` | `<Separator />` |
+| `<div className="animate-pulse">` with styled divs | `<Skeleton className="h-4 w-3/4" />` |
+| `<span className="rounded-full bg-green-100 ...">` | `<Badge variant="secondary">` |
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.agents/skills/shadcn/rules/forms.md
+SIZE: 4.93 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Forms & Inputs
+
+## Contents
+
+- Forms use FieldGroup + Field
+- InputGroup requires InputGroupInput/InputGroupTextarea
+- Buttons inside inputs use InputGroup + InputGroupAddon
+- Option sets (2–7 choices) use ToggleGroup
+- FieldSet + FieldLegend for grouping related fields
+- Field validation and disabled states
+
+---
+
+## Forms use FieldGroup + Field
+
+Always use `FieldGroup` + `Field` — never raw `div` with `space-y-*`:
+
+```tsx
+<FieldGroup>
+  <Field>
+    <FieldLabel htmlFor="email">Email</FieldLabel>
+    <Input id="email" type="email" />
+  </Field>
+  <Field>
+    <FieldLabel htmlFor="password">Password</FieldLabel>
+    <Input id="password" type="password" />
+  </Field>
+</FieldGroup>
+```
+
+Use `Field orientation="horizontal"` for settings pages. Use `FieldLabel className="sr-only"` for visually hidden labels.
+
+**Choosing form controls:**
+
+- Simple text input → `Input`
+- Dropdown with predefined options → `Select`
+- Searchable dropdown → `Combobox`
+- Native HTML select (no JS) → `native-select`
+- Boolean toggle → `Switch` (for settings) or `Checkbox` (for forms)
+- Single choice from few options → `RadioGroup`
+- Toggle between 2–5 options → `ToggleGroup` + `ToggleGroupItem`
+- OTP/verification code → `InputOTP`
+- Multi-line text → `Textarea`
+
+---
+
+## InputGroup requires InputGroupInput/InputGroupTextarea
+
+Never use raw `Input` or `Textarea` inside an `InputGroup`.
+
+**Incorrect:**
+
+```tsx
+<InputGroup>
+  <Input placeholder="Search..." />
+</InputGroup>
+```
+
+**Correct:**
+
+```tsx
+import { InputGroup, InputGroupInput } from "@/components/ui/input-group"
+
+<InputGroup>
+  <InputGroupInput placeholder="Search..." />
+</InputGroup>
+```
+
+---
+
+## Buttons inside inputs use InputGroup + InputGroupAddon
+
+Never place a `Button` directly inside or adjacent to an `Input` with custom positioning.
+
+**Incorrect:**
+
+```tsx
+<div className="relative">
+  <Input placeholder="Search..." className="pr-10" />
+  <Button className="absolute right-0 top-0" size="icon">
+    <SearchIcon />
+  </Button>
+</div>
+```
+
+**Correct:**
+
+```tsx
+import { InputGroup, InputGroupInput, InputGroupAddon } from "@/components/ui/input-group"
+
+<InputGroup>
+  <InputGroupInput placeholder="Search..." />
+  <InputGroupAddon>
+    <Button size="icon">
+      <SearchIcon data-icon="inline-start" />
+    </Button>
+  </InputGroupAddon>
+</InputGroup>
+```
+
+---
+
+## Option sets (2–7 choices) use ToggleGroup
+
+Don't manually loop `Button` components with active state.
+
+**Incorrect:**
+
+```tsx
+const [selected, setSelected] = useState("daily")
+
+<div className="flex gap-2">
+  {["daily", "weekly", "monthly"].map((option) => (
+    <Button
+      key={option}
+      variant={selected === option ? "default" : "outline"}
+      onClick={() => setSelected(option)}
+    >
+      {option}
+    </Button>
+  ))}
+</div>
+```
+
+**Correct:**
+
+```tsx
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+
+<ToggleGroup spacing={2}>
+  <ToggleGroupItem value="daily">Daily</ToggleGroupItem>
+  <ToggleGroupItem value="weekly">Weekly</ToggleGroupItem>
+  <ToggleGroupItem value="monthly">Monthly</ToggleGroupItem>
+</ToggleGroup>
+```
+
+Combine with `Field` for labelled toggle groups:
+
+```tsx
+<Field orientation="horizontal">
+  <FieldTitle id="theme-label">Theme</FieldTitle>
+  <ToggleGroup aria-labelledby="theme-label" spacing={2}>
+    <ToggleGroupItem value="light">Light</ToggleGroupItem>
+    <ToggleGroupItem value="dark">Dark</ToggleGroupItem>
+    <ToggleGroupItem value="system">System</ToggleGroupItem>
+  </ToggleGroup>
+</Field>
+```
+
+> **Note:** `defaultValue` and `type`/`multiple` props differ between base and radix. See [base-vs-radix.md](./base-vs-radix.md#togglegroup).
+
+---
+
+## FieldSet + FieldLegend for grouping related fields
+
+Use `FieldSet` + `FieldLegend` for related checkboxes, radios, or switches — not `div` with a heading:
+
+```tsx
+<FieldSet>
+  <FieldLegend variant="label">Preferences</FieldLegend>
+  <FieldDescription>Select all that apply.</FieldDescription>
+  <FieldGroup className="gap-3">
+    <Field orientation="horizontal">
+      <Checkbox id="dark" />
+      <FieldLabel htmlFor="dark" className="font-normal">Dark mode</FieldLabel>
+    </Field>
+  </FieldGroup>
+</FieldSet>
+```
+
+---
+
+## Field validation and disabled states
+
+Both attributes are needed — `data-invalid`/`data-disabled` styles the field (label, description), while `aria-invalid`/`disabled` styles the control.
+
+```tsx
+// Invalid.
+<Field data-invalid>
+  <FieldLabel htmlFor="email">Email</FieldLabel>
+  <Input id="email" aria-invalid />
+  <FieldDescription>Invalid email address.</FieldDescription>
+</Field>
+
+// Disabled.
+<Field data-disabled>
+  <FieldLabel htmlFor="email">Email</FieldLabel>
+  <Input id="email" disabled />
+</Field>
+```
+
+Works for all controls: `Input`, `Textarea`, `Select`, `Checkbox`, `RadioGroupItem`, `Switch`, `Slider`, `NativeSelect`, `InputOTP`.
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.agents/skills/shadcn/rules/icons.md
+SIZE: 2.01 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Icons
+
+**Always use the project's configured `iconLibrary` for imports.** Check the `iconLibrary` field from project context: `lucide` → `lucide-react`, `tabler` → `@tabler/icons-react`, etc. Never assume `lucide-react`.
+
+---
+
+## Icons in Button use data-icon attribute
+
+Add `data-icon="inline-start"` (prefix) or `data-icon="inline-end"` (suffix) to the icon. No sizing classes on the icon.
+
+**Incorrect:**
+
+```tsx
+<Button>
+  <SearchIcon className="mr-2 size-4" />
+  Search
+</Button>
+```
+
+**Correct:**
+
+```tsx
+<Button>
+  <SearchIcon data-icon="inline-start"/>
+  Search
+</Button>
+
+<Button>
+  Next
+  <ArrowRightIcon data-icon="inline-end"/>
+</Button>
+```
+
+---
+
+## No sizing classes on icons inside components
+
+Components handle icon sizing via CSS. Don't add `size-4`, `w-4 h-4`, or other sizing classes to icons inside `Button`, `DropdownMenuItem`, `Alert`, `Sidebar*`, or other shadcn components. Unless the user explicitly asks for custom icon sizes.
+
+**Incorrect:**
+
+```tsx
+<Button>
+  <SearchIcon className="size-4" data-icon="inline-start" />
+  Search
+</Button>
+
+<DropdownMenuItem>
+  <SettingsIcon className="mr-2 size-4" />
+  Settings
+</DropdownMenuItem>
+```
+
+**Correct:**
+
+```tsx
+<Button>
+  <SearchIcon data-icon="inline-start" />
+  Search
+</Button>
+
+<DropdownMenuItem>
+  <SettingsIcon />
+  Settings
+</DropdownMenuItem>
+```
+
+---
+
+## Pass icons as component objects, not string keys
+
+Use `icon={CheckIcon}`, not a string key to a lookup map.
+
+**Incorrect:**
+
+```tsx
+const iconMap = {
+  check: CheckIcon,
+  alert: AlertIcon,
+}
+
+function StatusBadge({ icon }: { icon: string }) {
+  const Icon = iconMap[icon]
+  return <Icon />
+}
+
+<StatusBadge icon="check" />
+```
+
+**Correct:**
+
+```tsx
+// Import from the project's configured iconLibrary (e.g. lucide-react, @tabler/icons-react).
+import { CheckIcon } from "lucide-react"
+
+function StatusBadge({ icon: Icon }: { icon: React.ComponentType }) {
+  return <Icon />
+}
+
+<StatusBadge icon={CheckIcon} />
+```
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.agents/skills/shadcn/rules/styling.md
+SIZE: 3.86 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Styling & Customization
+
+See [customization.md](../customization.md) for theming, CSS variables, and adding custom colors.
+
+## Contents
+
+- Semantic colors
+- Built-in variants first
+- className for layout only
+- No space-x-* / space-y-*
+- Prefer size-* over w-* h-* when equal
+- Prefer truncate shorthand
+- No manual dark: color overrides
+- Use cn() for conditional classes
+- No manual z-index on overlay components
+
+---
+
+## Semantic colors
+
+**Incorrect:**
+
+```tsx
+<div className="bg-blue-500 text-white">
+  <p className="text-gray-600">Secondary text</p>
+</div>
+```
+
+**Correct:**
+
+```tsx
+<div className="bg-primary text-primary-foreground">
+  <p className="text-muted-foreground">Secondary text</p>
+</div>
+```
+
+---
+
+## No raw color values for status/state indicators
+
+For positive, negative, or status indicators, use Badge variants, semantic tokens like `text-destructive`, or define custom CSS variables — don't reach for raw Tailwind colors.
+
+**Incorrect:**
+
+```tsx
+<span className="text-emerald-600">+20.1%</span>
+<span className="text-green-500">Active</span>
+<span className="text-red-600">-3.2%</span>
+```
+
+**Correct:**
+
+```tsx
+<Badge variant="secondary">+20.1%</Badge>
+<Badge>Active</Badge>
+<span className="text-destructive">-3.2%</span>
+```
+
+If you need a success/positive color that doesn't exist as a semantic token, use a Badge variant or ask the user about adding a custom CSS variable to the theme (see [customization.md](../customization.md)).
+
+---
+
+## Built-in variants first
+
+**Incorrect:**
+
+```tsx
+<Button className="border border-input bg-transparent hover:bg-accent">
+  Click me
+</Button>
+```
+
+**Correct:**
+
+```tsx
+<Button variant="outline">Click me</Button>
+```
+
+---
+
+## className for layout only
+
+Use `className` for layout (e.g. `max-w-md`, `mx-auto`, `mt-4`), **not** for overriding component colors or typography. To change colors, use semantic tokens, built-in variants, or CSS variables.
+
+**Incorrect:**
+
+```tsx
+<Card className="bg-blue-100 text-blue-900 font-bold">
+  <CardContent>Dashboard</CardContent>
+</Card>
+```
+
+**Correct:**
+
+```tsx
+<Card className="max-w-md mx-auto">
+  <CardContent>Dashboard</CardContent>
+</Card>
+```
+
+To customize a component's appearance, prefer these approaches in order:
+1. **Built-in variants** — `variant="outline"`, `variant="destructive"`, etc.
+2. **Semantic color tokens** — `bg-primary`, `text-muted-foreground`.
+3. **CSS variables** — define custom colors in the global CSS file (see [customization.md](../customization.md)).
+
+---
+
+## No space-x-* / space-y-*
+
+Use `gap-*` instead. `space-y-4` → `flex flex-col gap-4`. `space-x-2` → `flex gap-2`.
+
+```tsx
+<div className="flex flex-col gap-4">
+  <Input />
+  <Input />
+  <Button>Submit</Button>
+</div>
+```
+
+---
+
+## Prefer size-* over w-* h-* when equal
+
+`size-10` not `w-10 h-10`. Applies to icons, avatars, skeletons, etc.
+
+---
+
+## Prefer truncate shorthand
+
+`truncate` not `overflow-hidden text-ellipsis whitespace-nowrap`.
+
+---
+
+## No manual dark: color overrides
+
+Use semantic tokens — they handle light/dark via CSS variables. `bg-background text-foreground` not `bg-white dark:bg-gray-950`.
+
+---
+
+## Use cn() for conditional classes
+
+Use the `cn()` utility from the project for conditional or merged class names. Don't write manual ternaries in className strings.
+
+**Incorrect:**
+
+```tsx
+<div className={`flex items-center ${isActive ? "bg-primary text-primary-foreground" : "bg-muted"}`}>
+```
+
+**Correct:**
+
+```tsx
+import { cn } from "@/lib/utils"
+
+<div className={cn("flex items-center", isActive ? "bg-primary text-primary-foreground" : "bg-muted")}>
+```
+
+---
+
+## No manual z-index on overlay components
+
+`Dialog`, `Sheet`, `Drawer`, `AlertDialog`, `DropdownMenu`, `Popover`, `Tooltip`, `HoverCard` handle their own stacking. Never add `z-50` or `z-[999]`.
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.agents/skills/shadcn/SKILL.md
+SIZE: 16.65 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+---
+name: shadcn
+description: Manages shadcn components and projects — adding, searching, fixing, debugging, styling, and composing UI. Provides project context, component docs, and usage examples. Applies when working with shadcn/ui, component registries, presets, --preset codes, or any project with a components.json file. Also triggers for "shadcn init", "create an app with --preset", or "switch to --preset".
+user-invocable: false
+allowed-tools: Bash(npx shadcn@latest *), Bash(pnpm dlx shadcn@latest *), Bash(bunx --bun shadcn@latest *)
+---
+
+# shadcn/ui
+
+A framework for building ui, components and design systems. Components are added as source code to the user's project via the CLI.
+
+> **IMPORTANT:** Run all CLI commands using the project's package runner: `npx shadcn@latest`, `pnpm dlx shadcn@latest`, or `bunx --bun shadcn@latest` — based on the project's `packageManager`. Examples below use `npx shadcn@latest` but substitute the correct runner for the project.
+
+## Current Project Context
+
+```json
+!`npx shadcn@latest info --json`
+```
+
+The JSON above contains the project config and installed components. Use `npx shadcn@latest docs <component>` to get documentation and example URLs for any component.
+
+## Principles
+
+1. **Use existing components first.** Use `npx shadcn@latest search` to check registries before writing custom UI. Check community registries too.
+2. **Compose, don't reinvent.** Settings page = Tabs + Card + form controls. Dashboard = Sidebar + Card + Chart + Table.
+3. **Use built-in variants before custom styles.** `variant="outline"`, `size="sm"`, etc.
+4. **Use semantic colors.** `bg-primary`, `text-muted-foreground` — never raw values like `bg-blue-500`.
+
+## Critical Rules
+
+These rules are **always enforced**. Each links to a file with Incorrect/Correct code pairs.
+
+### Styling & Tailwind → [styling.md](./rules/styling.md)
+
+- **`className` for layout, not styling.** Never override component colors or typography.
+- **No `space-x-*` or `space-y-*`.** Use `flex` with `gap-*`. For vertical stacks, `flex flex-col gap-*`.
+- **Use `size-*` when width and height are equal.** `size-10` not `w-10 h-10`.
+- **Use `truncate` shorthand.** Not `overflow-hidden text-ellipsis whitespace-nowrap`.
+- **No manual `dark:` color overrides.** Use semantic tokens (`bg-background`, `text-muted-foreground`).
+- **Use `cn()` for conditional classes.** Don't write manual template literal ternaries.
+- **No manual `z-index` on overlay components.** Dialog, Sheet, Popover, etc. handle their own stacking.
+
+### Forms & Inputs → [forms.md](./rules/forms.md)
+
+- **Forms use `FieldGroup` + `Field`.** Never use raw `div` with `space-y-*` or `grid gap-*` for form layout.
+- **`InputGroup` uses `InputGroupInput`/`InputGroupTextarea`.** Never raw `Input`/`Textarea` inside `InputGroup`.
+- **Buttons inside inputs use `InputGroup` + `InputGroupAddon`.**
+- **Option sets (2–7 choices) use `ToggleGroup`.** Don't loop `Button` with manual active state.
+- **`FieldSet` + `FieldLegend` for grouping related checkboxes/radios.** Don't use a `div` with a heading.
+- **Field validation uses `data-invalid` + `aria-invalid`.** `data-invalid` on `Field`, `aria-invalid` on the control. For disabled: `data-disabled` on `Field`, `disabled` on the control.
+
+### Component Structure → [composition.md](./rules/composition.md)
+
+- **Items always inside their Group.** `SelectItem` → `SelectGroup`. `DropdownMenuItem` → `DropdownMenuGroup`. `CommandItem` → `CommandGroup`.
+- **Use `asChild` (radix) or `render` (base) for custom triggers.** Check `base` field from `npx shadcn@latest info`. → [base-vs-radix.md](./rules/base-vs-radix.md)
+- **Dialog, Sheet, and Drawer always need a Title.** `DialogTitle`, `SheetTitle`, `DrawerTitle` required for accessibility. Use `className="sr-only"` if visually hidden.
+- **Use full Card composition.** `CardHeader`/`CardTitle`/`CardDescription`/`CardContent`/`CardFooter`. Don't dump everything in `CardContent`.
+- **Button has no `isPending`/`isLoading`.** Compose with `Spinner` + `data-icon` + `disabled`.
+- **`TabsTrigger` must be inside `TabsList`.** Never render triggers directly in `Tabs`.
+- **`Avatar` always needs `AvatarFallback`.** For when the image fails to load.
+
+### Use Components, Not Custom Markup → [composition.md](./rules/composition.md)
+
+- **Use existing components before custom markup.** Check if a component exists before writing a styled `div`.
+- **Callouts use `Alert`.** Don't build custom styled divs.
+- **Empty states use `Empty`.** Don't build custom empty state markup.
+- **Toast via `sonner`.** Use `toast()` from `sonner`.
+- **Use `Separator`** instead of `<hr>` or `<div className="border-t">`.
+- **Use `Skeleton`** for loading placeholders. No custom `animate-pulse` divs.
+- **Use `Badge`** instead of custom styled spans.
+
+### Icons → [icons.md](./rules/icons.md)
+
+- **Icons in `Button` use `data-icon`.** `data-icon="inline-start"` or `data-icon="inline-end"` on the icon.
+- **No sizing classes on icons inside components.** Components handle icon sizing via CSS. No `size-4` or `w-4 h-4`.
+- **Pass icons as objects, not string keys.** `icon={CheckIcon}`, not a string lookup.
+
+### CLI
+
+- **Never decode or fetch preset codes manually.** Pass them directly to `npx shadcn@latest apply --preset <code>` for existing projects, or `npx shadcn@latest init --preset <code>` when initializing.
+
+## Key Patterns
+
+These are the most common patterns that differentiate correct shadcn/ui code. For edge cases, see the linked rule files above.
+
+```tsx
+// Form layout: FieldGroup + Field, not div + Label.
+<FieldGroup>
+  <Field>
+    <FieldLabel htmlFor="email">Email</FieldLabel>
+    <Input id="email" />
+  </Field>
+</FieldGroup>
+
+// Validation: data-invalid on Field, aria-invalid on the control.
+<Field data-invalid>
+  <FieldLabel>Email</FieldLabel>
+  <Input aria-invalid />
+  <FieldDescription>Invalid email.</FieldDescription>
+</Field>
+
+// Icons in buttons: data-icon, no sizing classes.
+<Button>
+  <SearchIcon data-icon="inline-start" />
+  Search
+</Button>
+
+// Spacing: gap-*, not space-y-*.
+<div className="flex flex-col gap-4">  // correct
+<div className="space-y-4">           // wrong
+
+// Equal dimensions: size-*, not w-* h-*.
+<Avatar className="size-10">   // correct
+<Avatar className="w-10 h-10"> // wrong
+
+// Status colors: Badge variants or semantic tokens, not raw colors.
+<Badge variant="secondary">+20.1%</Badge>    // correct
+<span className="text-emerald-600">+20.1%</span> // wrong
+```
+
+## Component Selection
+
+| Need                       | Use                                                                                                 |
+| -------------------------- | --------------------------------------------------------------------------------------------------- |
+| Button/action              | `Button` with appropriate variant                                                                   |
+| Form inputs                | `Input`, `Select`, `Combobox`, `Switch`, `Checkbox`, `RadioGroup`, `Textarea`, `InputOTP`, `Slider` |
+| Toggle between 2–5 options | `ToggleGroup` + `ToggleGroupItem`                                                                   |
+| Data display               | `Table`, `Card`, `Badge`, `Avatar`                                                                  |
+| Navigation                 | `Sidebar`, `NavigationMenu`, `Breadcrumb`, `Tabs`, `Pagination`                                     |
+| Overlays                   | `Dialog` (modal), `Sheet` (side panel), `Drawer` (bottom sheet), `AlertDialog` (confirmation)       |
+| Feedback                   | `sonner` (toast), `Alert`, `Progress`, `Skeleton`, `Spinner`                                        |
+| Command palette            | `Command` inside `Dialog`                                                                           |
+| Charts                     | `Chart` (wraps Recharts)                                                                            |
+| Layout                     | `Card`, `Separator`, `Resizable`, `ScrollArea`, `Accordion`, `Collapsible`                          |
+| Empty states               | `Empty`                                                                                             |
+| Menus                      | `DropdownMenu`, `ContextMenu`, `Menubar`                                                            |
+| Tooltips/info              | `Tooltip`, `HoverCard`, `Popover`                                                                   |
+
+## Key Fields
+
+The injected project context contains these key fields:
+
+- **`aliases`** → use the actual alias prefix for imports (e.g. `@/`, `~/`), never hardcode.
+- **`isRSC`** → when `true`, components using `useState`, `useEffect`, event handlers, or browser APIs need `"use client"` at the top of the file. Always reference this field when advising on the directive.
+- **`tailwindVersion`** → `"v4"` uses `@theme inline` blocks; `"v3"` uses `tailwind.config.js`.
+- **`tailwindCssFile`** → the global CSS file where custom CSS variables are defined. Always edit this file, never create a new one.
+- **`style`** → component visual treatment (e.g. `nova`, `vega`).
+- **`base`** → primitive library (`radix` or `base`). Affects component APIs and available props.
+- **`iconLibrary`** → determines icon imports. Use `lucide-react` for `lucide`, `@tabler/icons-react` for `tabler`, etc. Never assume `lucide-react`.
+- **`resolvedPaths`** → exact file-system destinations for components, utils, hooks, etc.
+- **`framework`** → routing and file conventions (e.g. Next.js App Router vs Vite SPA).
+- **`packageManager`** → use this for any non-shadcn dependency installs (e.g. `pnpm add date-fns` vs `npm install date-fns`).
+
+See [cli.md — `info` command](./cli.md) for the full field reference.
+
+## Component Docs, Examples, and Usage
+
+Run `npx shadcn@latest docs <component>` to get the URLs for a component's documentation, examples, and API reference. Fetch these URLs to get the actual content.
+
+```bash
+npx shadcn@latest docs button dialog select
+```
+
+**When creating, fixing, debugging, or using a component, always run `npx shadcn@latest docs` and fetch the URLs first.** This ensures you're working with the correct API and usage patterns rather than guessing.
+
+## Workflow
+
+1. **Get project context** — already injected above. Run `npx shadcn@latest info` again if you need to refresh.
+2. **Check installed components first** — before running `add`, always check the `components` list from project context or list the `resolvedPaths.ui` directory. Don't import components that haven't been added, and don't re-add ones already installed.
+3. **Find components** — `npx shadcn@latest search`.
+4. **Get docs and examples** — run `npx shadcn@latest docs <component>` to get URLs, then fetch them. Use `npx shadcn@latest view` to browse registry items you haven't installed. To preview changes to installed components, use `npx shadcn@latest add --diff`.
+5. **Install or update** — `npx shadcn@latest add`. When updating existing components, use `--dry-run` and `--diff` to preview changes first (see [Updating Components](#updating-components) below).
+6. **Fix imports in third-party components** — After adding components from community registries (e.g. `@bundui`, `@magicui`), check the added non-UI files for hardcoded import paths like `@/components/ui/...`. These won't match the project's actual aliases. Use `npx shadcn@latest info` to get the correct `ui` alias (e.g. `@workspace/ui/components`) and rewrite the imports accordingly. The CLI rewrites imports for its own UI files, but third-party registry components may use default paths that don't match the project.
+7. **Review added components** — After adding a component or block from any registry, **always read the added files and verify they are correct**. Check for missing sub-components (e.g. `SelectItem` without `SelectGroup`), missing imports, incorrect composition, or violations of the [Critical Rules](#critical-rules). Also replace any icon imports with the project's `iconLibrary` from the project context (e.g. if the registry item uses `lucide-react` but the project uses `hugeicons`, swap the imports and icon names accordingly). Fix all issues before moving on.
+8. **Registry must be explicit** — When the user asks to add a block or component, **do not guess the registry**. If no registry is specified (e.g. user says "add a login block" without specifying `@shadcn`, `@tailark`, etc.), ask which registry to use. Never default to a registry on behalf of the user.
+9. **Switching presets** — Ask the user first: **overwrite**, **merge**, or **skip**?
+   - **Overwrite**: `npx shadcn@latest apply --preset <code>`. Overwrites detected components, fonts, and CSS variables.
+   - **Merge**: `npx shadcn@latest init --preset <code> --force --no-reinstall`, then run `npx shadcn@latest info` to list installed components, then for each installed component use `--dry-run` and `--diff` to [smart merge](#updating-components) it individually.
+   - **Skip**: `npx shadcn@latest init --preset <code> --force --no-reinstall`. Only updates config and CSS, leaves components as-is.
+   - **Important**: Always run preset commands inside the user's project directory. `apply` only works in an existing project with a `components.json` file. The CLI automatically preserves the current base (`base` vs `radix`) from `components.json`. If you must use a scratch/temp directory (e.g. for `--dry-run` comparisons), pass `--base <current-base>` explicitly — preset codes do not encode the base.
+
+## Updating Components
+
+When the user asks to update a component from upstream while keeping their local changes, use `--dry-run` and `--diff` to intelligently merge. **NEVER fetch raw files from GitHub manually — always use the CLI.**
+
+1. Run `npx shadcn@latest add <component> --dry-run` to see all files that would be affected.
+2. For each file, run `npx shadcn@latest add <component> --diff <file>` to see what changed upstream vs local.
+3. Decide per file based on the diff:
+   - No local changes → safe to overwrite.
+   - Has local changes → read the local file, analyze the diff, and apply upstream updates while preserving local modifications.
+   - User says "just update everything" → use `--overwrite`, but confirm first.
+4. **Never use `--overwrite` without the user's explicit approval.**
+
+## Quick Reference
+
+```bash
+# Create a new project.
+npx shadcn@latest init --name my-app --preset base-nova
+npx shadcn@latest init --name my-app --preset a2r6bw --template vite
+
+# Create a monorepo project.
+npx shadcn@latest init --name my-app --preset base-nova --monorepo
+npx shadcn@latest init --name my-app --preset base-nova --template next --monorepo
+
+# Initialize existing project.
+npx shadcn@latest init --preset base-nova
+npx shadcn@latest init --defaults  # shortcut: --template=next --preset=nova (base style implied)
+
+# Apply a preset to an existing project.
+npx shadcn@latest apply --preset a2r6bw
+npx shadcn@latest apply a2r6bw
+
+# Add components.
+npx shadcn@latest add button card dialog
+npx shadcn@latest add @magicui/shimmer-button
+npx shadcn@latest add --all
+
+# Preview changes before adding/updating.
+npx shadcn@latest add button --dry-run
+npx shadcn@latest add button --diff button.tsx
+npx shadcn@latest add @acme/form --view button.tsx
+
+# Search registries.
+npx shadcn@latest search @shadcn -q "sidebar"
+npx shadcn@latest search @tailark -q "stats"
+
+# Get component docs and example URLs.
+npx shadcn@latest docs button dialog select
+
+# View registry item details (for items not yet installed).
+npx shadcn@latest view @shadcn/button
+```
+
+**Named presets:** `nova`, `vega`, `maia`, `lyra`, `mira`, `luma`
+**Templates:** `next`, `vite`, `start`, `react-router`, `astro` (all support `--monorepo`) and `laravel` (not supported for monorepo)
+**Preset codes:** Version-prefixed base62 strings (e.g. `a2r6bw` or `b0`), from [ui.shadcn.com](https://ui.shadcn.com).
+
+## Detailed References
+
+- [rules/forms.md](./rules/forms.md) — FieldGroup, Field, InputGroup, ToggleGroup, FieldSet, validation states
+- [rules/composition.md](./rules/composition.md) — Groups, overlays, Card, Tabs, Avatar, Alert, Empty, Toast, Separator, Skeleton, Badge, Button loading
+- [rules/icons.md](./rules/icons.md) — data-icon, icon sizing, passing icons as objects
+- [rules/styling.md](./rules/styling.md) — Semantic colors, variants, className, spacing, size, truncate, dark mode, cn(), z-index
+- [rules/base-vs-radix.md](./rules/base-vs-radix.md) — asChild vs render, Select, ToggleGroup, Slider, Accordion
+- [cli.md](./cli.md) — Commands, flags, presets, templates
+- [customization.md](./customization.md) — Theming, CSS variables, extending components
+
+
+
+================================================================================
 FILE: src/AppointMe.Frontend/.claude/skills/shadcn/agents/openai.yml
 SIZE: 0.24 KB
 MODIFIED: 06/11/2026 13:31:28
@@ -9014,6 +11566,509 @@ interface:
   short_description: "Manages shadcn/ui components — adding, searching, fixing, debugging, styling, and composing UI."
   icon_small: "./assets/shadcn-small.png"
   icon_large: "./assets/shadcn.png"
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.claude/skills/shadcn/cli.md
+SIZE: 16.31 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# shadcn CLI Reference
+
+Configuration is read from `components.json`.
+
+> **IMPORTANT:** Always run commands using the project's package runner: `npx shadcn@latest`, `pnpm dlx shadcn@latest`, or `bunx --bun shadcn@latest`. Check `packageManager` from project context to choose the right one. Examples below use `npx shadcn@latest` but substitute the correct runner for the project.
+
+> **IMPORTANT:** Only use the flags documented below. Do not invent or guess flags — if a flag isn't listed here, it doesn't exist. The CLI auto-detects the package manager from the project's lockfile; there is no `--package-manager` flag.
+
+## Contents
+
+- Commands: init, apply, add (dry-run, smart merge), search, view, docs, info, build
+- Templates: next, vite, start, react-router, astro
+- Presets: named, code, URL formats and fields
+- Switching presets
+
+---
+
+## Commands
+
+### `init` — Initialize or create a project
+
+```bash
+npx shadcn@latest init [components...] [options]
+```
+
+Initializes shadcn/ui in an existing project or creates a new project (when `--name` is provided). Optionally installs components in the same step.
+
+| Flag                    | Short | Description                                               | Default |
+| ----------------------- | ----- | --------------------------------------------------------- | ------- |
+| `--template <template>` | `-t`  | Template (next, start, vite, next-monorepo, react-router) | —       |
+| `--preset [name]`       | `-p`  | Preset configuration (named, code, or URL)                | —       |
+| `--yes`                 | `-y`  | Skip confirmation prompt                                  | `true`  |
+| `--defaults`            | `-d`  | Use defaults (`--template=next --preset=base-nova`)       | `false` |
+| `--force`               | `-f`  | Force overwrite existing configuration                    | `false` |
+| `--cwd <cwd>`           | `-c`  | Working directory                                         | current |
+| `--name <name>`         | `-n`  | Name for new project                                      | —       |
+| `--silent`              | `-s`  | Mute output                                               | `false` |
+| `--rtl`                 |       | Enable RTL support                                        | —       |
+| `--reinstall`           |       | Re-install existing UI components                         | `false` |
+| `--monorepo`            |       | Scaffold a monorepo project                               | —       |
+| `--no-monorepo`         |       | Skip the monorepo prompt                                  | —       |
+
+`npx shadcn@latest create` is an alias for `npx shadcn@latest init`.
+
+### `apply` — Apply a preset to an existing project
+
+```bash
+npx shadcn@latest apply [preset] [options]
+```
+
+Applies a preset to an existing project, overwriting preset-driven config, fonts, CSS variables, and detected UI components.
+
+| Flag                | Short | Description                                | Default |
+| ------------------- | ----- | ------------------------------------------ | ------- |
+| `--preset <preset>` | —     | Preset configuration (named, code, or URL) | —       |
+| `--yes`             | `-y`  | Skip confirmation prompt                   | `false` |
+| `--cwd <cwd>`       | `-c`  | Working directory                          | current |
+| `--silent`          | `-s`  | Mute output                                | `false` |
+
+`[preset]` is a shorthand for `--preset <preset>`. If both are provided, they must match.
+If no preset is provided, the CLI offers to open the custom preset builder on `ui.shadcn.com/create`.
+
+### `add` — Add components
+
+> **IMPORTANT:** To compare local components against upstream or to preview changes, ALWAYS use `npx shadcn@latest add <component> --dry-run`, `--diff`, or `--view`. NEVER fetch raw files from GitHub or other sources manually. The CLI handles registry resolution, file paths, and CSS diffing automatically.
+
+```bash
+npx shadcn@latest add [components...] [options]
+```
+
+Accepts component names, registry-prefixed names (`@magicui/shimmer-button`), URLs, or local paths.
+
+| Flag            | Short | Description                                                                                                          | Default |
+| --------------- | ----- | -------------------------------------------------------------------------------------------------------------------- | ------- |
+| `--yes`         | `-y`  | Skip confirmation prompt                                                                                             | `false` |
+| `--overwrite`   | `-o`  | Overwrite existing files                                                                                             | `false` |
+| `--cwd <cwd>`   | `-c`  | Working directory                                                                                                    | current |
+| `--all`         | `-a`  | Add all available components                                                                                         | `false` |
+| `--path <path>` | `-p`  | Target path for the component                                                                                        | —       |
+| `--silent`      | `-s`  | Mute output                                                                                                          | `false` |
+| `--dry-run`     |       | Preview all changes without writing files                                                                            | `false` |
+| `--diff [path]` |       | Show diffs. Without a path, shows the first 5 files. With a path, shows that file only (implies `--dry-run`)         | —       |
+| `--view [path]` |       | Show file contents. Without a path, shows the first 5 files. With a path, shows that file only (implies `--dry-run`) | —       |
+
+#### Dry-Run Mode
+
+Use `--dry-run` to preview what `add` would do without writing any files. `--diff` and `--view` both imply `--dry-run`.
+
+```bash
+# Preview all changes.
+npx shadcn@latest add button --dry-run
+
+# Show diffs for all files (top 5).
+npx shadcn@latest add button --diff
+
+# Show the diff for a specific file.
+npx shadcn@latest add button --diff button.tsx
+
+# Show contents for all files (top 5).
+npx shadcn@latest add button --view
+
+# Show the full content of a specific file.
+npx shadcn@latest add button --view button.tsx
+
+# Works with URLs too.
+npx shadcn@latest add https://api.npoint.io/abc123 --dry-run
+
+# CSS diffs.
+npx shadcn@latest add button --diff globals.css
+```
+
+**When to use dry-run:**
+
+- When the user asks "what files will this add?" or "what will this change?" — use `--dry-run`.
+- Before overwriting existing components — use `--diff` to preview the changes first.
+- When the user wants to inspect component source code without installing — use `--view`.
+- When checking what CSS changes would be made to `globals.css` — use `--diff globals.css`.
+- When the user asks to review or audit third-party registry code before installing — use `--view` to inspect the source.
+
+> **`npx shadcn@latest add --dry-run` vs `npx shadcn@latest view`:** Prefer `npx shadcn@latest add --dry-run/--diff/--view` over `npx shadcn@latest view` when the user wants to preview changes to their project. `npx shadcn@latest view` only shows raw registry metadata. `npx shadcn@latest add --dry-run` shows exactly what would happen in the user's project: resolved file paths, diffs against existing files, and CSS updates. Use `npx shadcn@latest view` only when the user wants to browse registry info without a project context.
+
+#### Smart Merge from Upstream
+
+See [Updating Components in SKILL.md](./SKILL.md#updating-components) for the full workflow.
+
+### `search` — Search registries
+
+```bash
+npx shadcn@latest search <registries...> [options]
+```
+
+Fuzzy search across registries. Also aliased as `npx shadcn@latest list`. Without `-q`, lists all items.
+
+| Flag                | Short | Description            | Default |
+| ------------------- | ----- | ---------------------- | ------- |
+| `--query <query>`   | `-q`  | Search query           | —       |
+| `--limit <number>`  | `-l`  | Max items per registry | `100`   |
+| `--offset <number>` | `-o`  | Items to skip          | `0`     |
+| `--cwd <cwd>`       | `-c`  | Working directory      | current |
+
+### `view` — View item details
+
+```bash
+npx shadcn@latest view <items...> [options]
+```
+
+Displays item info including file contents. Example: `npx shadcn@latest view @shadcn/button`.
+
+### `docs` — Get component documentation URLs
+
+```bash
+npx shadcn@latest docs <components...> [options]
+```
+
+Outputs resolved URLs for component documentation, examples, and API references. Accepts one or more component names. Fetch the URLs to get the actual content.
+
+Example output for `npx shadcn@latest docs input button`:
+
+```
+base  radix
+
+input
+  docs      https://ui.shadcn.com/docs/components/radix/input
+  examples  https://raw.githubusercontent.com/.../examples/input-example.tsx
+
+button
+  docs      https://ui.shadcn.com/docs/components/radix/button
+  examples  https://raw.githubusercontent.com/.../examples/button-example.tsx
+```
+
+Some components include an `api` link to the underlying library (e.g. `cmdk` for the command component).
+
+### `diff` — Check for updates
+
+Do not use this command. Use `npx shadcn@latest add --diff` instead.
+
+### `info` — Project information
+
+```bash
+npx shadcn@latest info [options]
+```
+
+Displays project info and `components.json` configuration. Run this first to discover the project's framework, aliases, Tailwind version, and resolved paths.
+
+| Flag          | Short | Description       | Default |
+| ------------- | ----- | ----------------- | ------- |
+| `--cwd <cwd>` | `-c`  | Working directory | current |
+
+**Project Info fields:**
+
+| Field                | Type      | Meaning                                                            |
+| -------------------- | --------- | ------------------------------------------------------------------ |
+| `framework`          | `string`  | Detected framework (`next`, `vite`, `react-router`, `start`, etc.) |
+| `frameworkVersion`   | `string`  | Framework version (e.g. `15.2.4`)                                  |
+| `isSrcDir`           | `boolean` | Whether the project uses a `src/` directory                        |
+| `isRSC`              | `boolean` | Whether React Server Components are enabled                        |
+| `isTsx`              | `boolean` | Whether the project uses TypeScript                                |
+| `tailwindVersion`    | `string`  | `"v3"` or `"v4"`                                                   |
+| `tailwindConfigFile` | `string`  | Path to the Tailwind config file                                   |
+| `tailwindCssFile`    | `string`  | Path to the global CSS file                                        |
+| `aliasPrefix`        | `string`  | Import alias prefix (e.g. `@`, `~`, `@/`)                          |
+| `packageManager`     | `string`  | Detected package manager (`npm`, `pnpm`, `yarn`, `bun`)            |
+
+**Components.json fields:**
+
+| Field                | Type      | Meaning                                                                                    |
+| -------------------- | --------- | ------------------------------------------------------------------------------------------ |
+| `base`               | `string`  | Primitive library (`radix` or `base`) — determines component APIs and available props      |
+| `style`              | `string`  | Visual style (e.g. `nova`, `vega`)                                                         |
+| `rsc`                | `boolean` | RSC flag from config                                                                       |
+| `tsx`                | `boolean` | TypeScript flag                                                                            |
+| `tailwind.config`    | `string`  | Tailwind config path                                                                       |
+| `tailwind.css`       | `string`  | Global CSS path — this is where custom CSS variables go                                    |
+| `iconLibrary`        | `string`  | Icon library — determines icon import package (e.g. `lucide-react`, `@tabler/icons-react`) |
+| `aliases.components` | `string`  | Component import alias (e.g. `@/components`)                                               |
+| `aliases.utils`      | `string`  | Utils import alias (e.g. `@/lib/utils`)                                                    |
+| `aliases.ui`         | `string`  | UI component alias (e.g. `@/components/ui`)                                                |
+| `aliases.lib`        | `string`  | Lib alias (e.g. `@/lib`)                                                                   |
+| `aliases.hooks`      | `string`  | Hooks alias (e.g. `@/hooks`)                                                               |
+| `resolvedPaths`      | `object`  | Absolute file-system paths for each alias                                                  |
+| `registries`         | `object`  | Configured custom registries                                                               |
+
+**Links fields:**
+
+The `info` output includes a **Links** section with templated URLs for component docs, source, and examples. For resolved URLs, use `npx shadcn@latest docs <component>` instead.
+
+### `build` — Build a custom registry
+
+```bash
+npx shadcn@latest build [registry] [options]
+```
+
+Builds `registry.json` into individual JSON files for distribution. Default input: `./registry.json`, default output: `./public/r`.
+
+| Flag              | Short | Description       | Default      |
+| ----------------- | ----- | ----------------- | ------------ |
+| `--output <path>` | `-o`  | Output directory  | `./public/r` |
+| `--cwd <cwd>`     | `-c`  | Working directory | current      |
+
+---
+
+## Templates
+
+| Value          | Framework      | Monorepo support |
+| -------------- | -------------- | ---------------- |
+| `next`         | Next.js        | Yes              |
+| `vite`         | Vite           | Yes              |
+| `start`        | TanStack Start | Yes              |
+| `react-router` | React Router   | Yes              |
+| `astro`        | Astro          | Yes              |
+| `laravel`      | Laravel        | No               |
+
+All templates support monorepo scaffolding via the `--monorepo` flag. When passed, the CLI uses a monorepo-specific template directory (e.g. `next-monorepo`, `vite-monorepo`). When neither `--monorepo` nor `--no-monorepo` is passed, the CLI prompts interactively. Laravel does not support monorepo scaffolding.
+
+---
+
+## Presets
+
+Three ways to specify a preset via `--preset`:
+
+1. **Named:** `--preset nova` or `--preset lyra`
+2. **Code:** `--preset a2r6bw` (version-prefixed base62 string, e.g. `a2r6bw` or `b0`)
+3. **URL:** `--preset "https://ui.shadcn.com/init?base=radix&style=nova&..."`
+
+> **IMPORTANT:** Never try to decode, fetch, or resolve preset codes manually. Preset codes are opaque — pass them directly to `npx shadcn@latest init --preset <code>` and let the CLI handle resolution.
+> Use `npx shadcn@latest apply --preset <code>` when overwriting an existing project's preset.
+
+## Switching Presets
+
+Ask the user first: **overwrite**, **merge**, or **skip** existing components?
+
+- **Overwrite / Re-install** → `npx shadcn@latest apply --preset <code>`. Overwrites all detected component files with the new preset styles. Use when the user hasn't customized components.
+- **Merge** → `npx shadcn@latest init --preset <code> --force --no-reinstall`, then run `npx shadcn@latest info` to get the list of installed components and use the [smart merge workflow](./SKILL.md#updating-components) to update them one by one, preserving local changes. Use when the user has customized components.
+- **Skip** → `npx shadcn@latest init --preset <code> --force --no-reinstall`. Only updates config and CSS variables, leaves existing components as-is.
+
+Always run preset commands inside the user's project directory. `apply` only works in an existing project with a `components.json` file. The CLI automatically preserves the current base (`base` vs `radix`) from `components.json`. If you must use a scratch/temp directory (e.g. for `--dry-run` comparisons), pass `--base <current-base>` explicitly — preset codes do not encode the base.
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.claude/skills/shadcn/customization.md
+SIZE: 6.14 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Customization & Theming
+
+Components reference semantic CSS variable tokens. Change the variables to change every component.
+
+## Contents
+
+- How it works (CSS variables → Tailwind utilities → components)
+- Color variables and OKLCH format
+- Dark mode setup
+- Changing the theme (presets, CSS variables)
+- Adding custom colors (Tailwind v3 and v4)
+- Border radius
+- Customizing components (variants, className, wrappers)
+- Checking for updates
+
+---
+
+## How It Works
+
+1. CSS variables defined in `:root` (light) and `.dark` (dark mode).
+2. Tailwind maps them to utilities: `bg-primary`, `text-muted-foreground`, etc.
+3. Components use these utilities — changing a variable changes all components that reference it.
+
+---
+
+## Color Variables
+
+Every color follows the `name` / `name-foreground` convention. The base variable is for backgrounds, `-foreground` is for text/icons on that background.
+
+| Variable                                     | Purpose                          |
+| -------------------------------------------- | -------------------------------- |
+| `--background` / `--foreground`              | Page background and default text |
+| `--card` / `--card-foreground`               | Card surfaces                    |
+| `--primary` / `--primary-foreground`         | Primary buttons and actions      |
+| `--secondary` / `--secondary-foreground`     | Secondary actions                |
+| `--muted` / `--muted-foreground`             | Muted/disabled states            |
+| `--accent` / `--accent-foreground`           | Hover and accent states          |
+| `--destructive` / `--destructive-foreground` | Error and destructive actions    |
+| `--border`                                   | Default border color             |
+| `--input`                                    | Form input borders               |
+| `--ring`                                     | Focus ring color                 |
+| `--chart-1` through `--chart-5`              | Chart/data visualization         |
+| `--sidebar-*`                                | Sidebar-specific colors          |
+| `--surface` / `--surface-foreground`         | Secondary surface                |
+
+Colors use OKLCH: `--primary: oklch(0.205 0 0)` where values are lightness (0–1), chroma (0 = gray), and hue (0–360).
+
+---
+
+## Dark Mode
+
+Class-based toggle via `.dark` on the root element. In Next.js, use `next-themes`:
+
+```tsx
+import { ThemeProvider } from "next-themes"
+
+<ThemeProvider attribute="class" defaultTheme="system" enableSystem>
+  {children}
+</ThemeProvider>
+```
+
+---
+
+## Changing the Theme
+
+```bash
+# Apply a preset code from ui.shadcn.com.
+npx shadcn@latest apply --preset a2r6bw
+
+# Positional shorthand also works.
+npx shadcn@latest apply a2r6bw
+
+# Switch to a named preset and overwrite existing components.
+npx shadcn@latest apply --preset nova
+
+# Preserve existing components instead.
+npx shadcn@latest init --preset nova --force --no-reinstall
+
+# Use a custom theme URL.
+npx shadcn@latest apply --preset "https://ui.shadcn.com/init?base=radix&style=nova&theme=blue&..."
+```
+
+Or edit CSS variables directly in `globals.css`.
+
+---
+
+## Adding Custom Colors
+
+Add variables to the file at `tailwindCssFile` from `npx shadcn@latest info` (typically `globals.css`). Never create a new CSS file for this.
+
+```css
+/* 1. Define in the global CSS file. */
+:root {
+  --warning: oklch(0.84 0.16 84);
+  --warning-foreground: oklch(0.28 0.07 46);
+}
+.dark {
+  --warning: oklch(0.41 0.11 46);
+  --warning-foreground: oklch(0.99 0.02 95);
+}
+```
+
+```css
+/* 2a. Register with Tailwind v4 (@theme inline). */
+@theme inline {
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+}
+```
+
+When `tailwindVersion` is `"v3"` (check via `npx shadcn@latest info`), register in `tailwind.config.js` instead:
+
+```js
+// 2b. Register with Tailwind v3 (tailwind.config.js).
+module.exports = {
+  theme: {
+    extend: {
+      colors: {
+        warning: "oklch(var(--warning) / <alpha-value>)",
+        "warning-foreground":
+          "oklch(var(--warning-foreground) / <alpha-value>)",
+      },
+    },
+  },
+}
+```
+
+```tsx
+// 3. Use in components.
+<div className="bg-warning text-warning-foreground">Warning</div>
+```
+
+---
+
+## Border Radius
+
+`--radius` controls border radius globally. Components derive values from it (`rounded-lg` = `var(--radius)`, `rounded-md` = `calc(var(--radius) - 2px)`).
+
+---
+
+## Customizing Components
+
+See also: [rules/styling.md](./rules/styling.md) for Incorrect/Correct examples.
+
+Prefer these approaches in order:
+
+### 1. Built-in variants
+
+```tsx
+<Button variant="outline" size="sm">
+  Click
+</Button>
+```
+
+### 2. Tailwind classes via `className`
+
+```tsx
+<Card className="mx-auto max-w-md">...</Card>
+```
+
+### 3. Add a new variant
+
+Edit the component source to add a variant via `cva`:
+
+```tsx
+// components/ui/button.tsx
+warning: "bg-warning text-warning-foreground hover:bg-warning/90",
+```
+
+### 4. Wrapper components
+
+Compose shadcn/ui primitives into higher-level components:
+
+```tsx
+export function ConfirmDialog({ title, description, onConfirm, children }) {
+  return (
+    <AlertDialog>
+      <AlertDialogTrigger asChild>{children}</AlertDialogTrigger>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{title}</AlertDialogTitle>
+          <AlertDialogDescription>{description}</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={onConfirm}>Confirm</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+```
+
+---
+
+## Checking for Updates
+
+```bash
+npx shadcn@latest add button --diff
+```
+
+To preview exactly what would change before updating, use `--dry-run` and `--diff`:
+
+```bash
+npx shadcn@latest add button --dry-run        # see all affected files
+npx shadcn@latest add button --diff button.tsx # see the diff for a specific file
+```
+
+See [Updating Components in SKILL.md](./SKILL.md#updating-components) for the full smart merge workflow.
 
 
 
@@ -9074,6 +12129,1365 @@ MODIFIED: 06/11/2026 13:31:28
 
 
 ================================================================================
+FILE: src/AppointMe.Frontend/.claude/skills/shadcn/mcp.md
+SIZE: 2.42 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# shadcn MCP Server
+
+The CLI includes an MCP server that lets AI assistants search, browse, view, and install components from registries.
+
+---
+
+## Setup
+
+```bash
+shadcn mcp        # start the MCP server (stdio)
+shadcn mcp init   # write config for your editor
+```
+
+Editor config files:
+
+| Editor | Config file |
+|--------|------------|
+| Claude Code | `.mcp.json` |
+| Cursor | `.cursor/mcp.json` |
+| VS Code | `.vscode/mcp.json` |
+| OpenCode | `opencode.json` |
+| Codex | `~/.codex/config.toml` (manual) |
+
+---
+
+## Tools
+
+> **Tip:** MCP tools handle registry operations (search, view, install). For project configuration (aliases, framework, Tailwind version), use `npx shadcn@latest info` — there is no MCP equivalent.
+
+### `shadcn:get_project_registries`
+
+Returns registry names from `components.json`. Errors if no `components.json` exists.
+
+**Input:** none
+
+### `shadcn:list_items_in_registries`
+
+Lists all items from one or more registries.
+
+**Input:** `registries` (string[]), `limit` (number, optional), `offset` (number, optional)
+
+### `shadcn:search_items_in_registries`
+
+Fuzzy search across registries.
+
+**Input:** `registries` (string[]), `query` (string), `limit` (number, optional), `offset` (number, optional)
+
+### `shadcn:view_items_in_registries`
+
+View item details including full file contents.
+
+**Input:** `items` (string[]) — e.g. `["@shadcn/button", "@shadcn/card"]`
+
+### `shadcn:get_item_examples_from_registries`
+
+Find usage examples and demos with source code.
+
+**Input:** `registries` (string[]), `query` (string) — e.g. `"accordion-demo"`, `"button example"`
+
+### `shadcn:get_add_command_for_items`
+
+Returns the CLI install command.
+
+**Input:** `items` (string[]) — e.g. `["@shadcn/button"]`
+
+### `shadcn:get_audit_checklist`
+
+Returns a checklist for verifying components (imports, deps, lint, TypeScript).
+
+**Input:** none
+
+---
+
+## Configuring Registries
+
+Registries are set in `components.json`. The `@shadcn` registry is always built-in.
+
+```json
+{
+  "registries": {
+    "@acme": "https://acme.com/r/{name}.json",
+    "@private": {
+      "url": "https://private.com/r/{name}.json",
+      "headers": { "Authorization": "Bearer ${MY_TOKEN}" }
+    }
+  }
+}
+```
+
+- Names must start with `@`.
+- URLs must contain `{name}`.
+- `${VAR}` references are resolved from environment variables.
+
+Community registry index: `https://ui.shadcn.com/r/registries.json`
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.claude/skills/shadcn/rules/base-vs-radix.md
+SIZE: 7.09 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Base vs Radix
+
+API differences between `base` and `radix`. Check the `base` field from `npx shadcn@latest info`.
+
+## Contents
+
+- Composition: asChild vs render
+- Button / trigger as non-button element
+- Select (items prop, placeholder, positioning, multiple, object values)
+- ToggleGroup (type vs multiple)
+- Slider (scalar vs array)
+- Accordion (type and defaultValue)
+
+---
+
+## Composition: asChild (radix) vs render (base)
+
+Radix uses `asChild` to replace the default element. Base uses `render`. Don't wrap triggers in extra elements.
+
+**Incorrect:**
+
+```tsx
+<DialogTrigger>
+  <div>
+    <Button>Open</Button>
+  </div>
+</DialogTrigger>
+```
+
+**Correct (radix):**
+
+```tsx
+<DialogTrigger asChild>
+  <Button>Open</Button>
+</DialogTrigger>
+```
+
+**Correct (base):**
+
+```tsx
+<DialogTrigger render={<Button />}>Open</DialogTrigger>
+```
+
+This applies to all trigger and close components: `DialogTrigger`, `SheetTrigger`, `AlertDialogTrigger`, `DropdownMenuTrigger`, `PopoverTrigger`, `TooltipTrigger`, `CollapsibleTrigger`, `DialogClose`, `SheetClose`, `NavigationMenuLink`, `BreadcrumbLink`, `SidebarMenuButton`, `Badge`, `Item`.
+
+---
+
+## Button / trigger as non-button element (base only)
+
+When `render` changes an element to a non-button (`<a>`, `<span>`), add `nativeButton={false}`.
+
+**Incorrect (base):** missing `nativeButton={false}`.
+
+```tsx
+<Button render={<a href="/docs" />}>Read the docs</Button>
+```
+
+**Correct (base):**
+
+```tsx
+<Button render={<a href="/docs" />} nativeButton={false}>
+  Read the docs
+</Button>
+```
+
+**Correct (radix):**
+
+```tsx
+<Button asChild>
+  <a href="/docs">Read the docs</a>
+</Button>
+```
+
+Same for triggers whose `render` is not a `Button`:
+
+```tsx
+// base.
+<PopoverTrigger render={<InputGroupAddon />} nativeButton={false}>
+  Pick date
+</PopoverTrigger>
+```
+
+---
+
+## Select
+
+**items prop (base only).** Base requires an `items` prop on the root. Radix uses inline JSX only.
+
+**Incorrect (base):**
+
+```tsx
+<Select>
+  <SelectTrigger><SelectValue placeholder="Select a fruit" /></SelectTrigger>
+</Select>
+```
+
+**Correct (base):**
+
+```tsx
+const items = [
+  { label: "Select a fruit", value: null },
+  { label: "Apple", value: "apple" },
+  { label: "Banana", value: "banana" },
+]
+
+<Select items={items}>
+  <SelectTrigger>
+    <SelectValue />
+  </SelectTrigger>
+  <SelectContent>
+    <SelectGroup>
+      {items.map((item) => (
+        <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+      ))}
+    </SelectGroup>
+  </SelectContent>
+</Select>
+```
+
+**Correct (radix):**
+
+```tsx
+<Select>
+  <SelectTrigger>
+    <SelectValue placeholder="Select a fruit" />
+  </SelectTrigger>
+  <SelectContent>
+    <SelectGroup>
+      <SelectItem value="apple">Apple</SelectItem>
+      <SelectItem value="banana">Banana</SelectItem>
+    </SelectGroup>
+  </SelectContent>
+</Select>
+```
+
+**Placeholder.** Base uses a `{ value: null }` item in the items array. Radix uses `<SelectValue placeholder="...">`.
+
+**Content positioning.** Base uses `alignItemWithTrigger`. Radix uses `position`.
+
+```tsx
+// base.
+<SelectContent alignItemWithTrigger={false} side="bottom">
+
+// radix.
+<SelectContent position="popper">
+```
+
+---
+
+## Select — multiple selection and object values (base only)
+
+Base supports `multiple`, render-function children on `SelectValue`, and object values with `itemToStringValue`. Radix is single-select with string values only.
+
+**Correct (base — multiple selection):**
+
+```tsx
+<Select items={items} multiple defaultValue={[]}>
+  <SelectTrigger>
+    <SelectValue>
+      {(value: string[]) => value.length === 0 ? "Select fruits" : `${value.length} selected`}
+    </SelectValue>
+  </SelectTrigger>
+  ...
+</Select>
+```
+
+**Correct (base — object values):**
+
+```tsx
+<Select defaultValue={plans[0]} itemToStringValue={(plan) => plan.name}>
+  <SelectTrigger>
+    <SelectValue>{(value) => value.name}</SelectValue>
+  </SelectTrigger>
+  ...
+</Select>
+```
+
+---
+
+## ToggleGroup
+
+Base uses a `multiple` boolean prop. Radix uses `type="single"` or `type="multiple"`.
+
+**Incorrect (base):**
+
+```tsx
+<ToggleGroup type="single" defaultValue="daily">
+  <ToggleGroupItem value="daily">Daily</ToggleGroupItem>
+</ToggleGroup>
+```
+
+**Correct (base):**
+
+```tsx
+// Single (no prop needed), defaultValue is always an array.
+<ToggleGroup defaultValue={["daily"]} spacing={2}>
+  <ToggleGroupItem value="daily">Daily</ToggleGroupItem>
+  <ToggleGroupItem value="weekly">Weekly</ToggleGroupItem>
+</ToggleGroup>
+
+// Multi-selection.
+<ToggleGroup multiple>
+  <ToggleGroupItem value="bold">Bold</ToggleGroupItem>
+  <ToggleGroupItem value="italic">Italic</ToggleGroupItem>
+</ToggleGroup>
+```
+
+**Correct (radix):**
+
+```tsx
+// Single, defaultValue is a string.
+<ToggleGroup type="single" defaultValue="daily" spacing={2}>
+  <ToggleGroupItem value="daily">Daily</ToggleGroupItem>
+  <ToggleGroupItem value="weekly">Weekly</ToggleGroupItem>
+</ToggleGroup>
+
+// Multi-selection.
+<ToggleGroup type="multiple">
+  <ToggleGroupItem value="bold">Bold</ToggleGroupItem>
+  <ToggleGroupItem value="italic">Italic</ToggleGroupItem>
+</ToggleGroup>
+```
+
+**Controlled single value:**
+
+```tsx
+// base — wrap/unwrap arrays.
+const [value, setValue] = React.useState("normal")
+<ToggleGroup value={[value]} onValueChange={(v) => setValue(v[0])}>
+
+// radix — plain string.
+const [value, setValue] = React.useState("normal")
+<ToggleGroup type="single" value={value} onValueChange={setValue}>
+```
+
+---
+
+## Slider
+
+Base accepts a plain number for a single thumb. Radix always requires an array.
+
+**Incorrect (base):**
+
+```tsx
+<Slider defaultValue={[50]} max={100} step={1} />
+```
+
+**Correct (base):**
+
+```tsx
+<Slider defaultValue={50} max={100} step={1} />
+```
+
+**Correct (radix):**
+
+```tsx
+<Slider defaultValue={[50]} max={100} step={1} />
+```
+
+Both use arrays for range sliders. Controlled `onValueChange` in base may need a cast:
+
+```tsx
+// base.
+const [value, setValue] = React.useState([0.3, 0.7])
+<Slider value={value} onValueChange={(v) => setValue(v as number[])} />
+
+// radix.
+const [value, setValue] = React.useState([0.3, 0.7])
+<Slider value={value} onValueChange={setValue} />
+```
+
+---
+
+## Accordion
+
+Radix requires `type="single"` or `type="multiple"` and supports `collapsible`. `defaultValue` is a string. Base uses no `type` prop, uses `multiple` boolean, and `defaultValue` is always an array.
+
+**Incorrect (base):**
+
+```tsx
+<Accordion type="single" collapsible defaultValue="item-1">
+  <AccordionItem value="item-1">...</AccordionItem>
+</Accordion>
+```
+
+**Correct (base):**
+
+```tsx
+<Accordion defaultValue={["item-1"]}>
+  <AccordionItem value="item-1">...</AccordionItem>
+</Accordion>
+
+// Multi-select.
+<Accordion multiple defaultValue={["item-1", "item-2"]}>
+  <AccordionItem value="item-1">...</AccordionItem>
+  <AccordionItem value="item-2">...</AccordionItem>
+</Accordion>
+```
+
+**Correct (radix):**
+
+```tsx
+<Accordion type="single" collapsible defaultValue="item-1">
+  <AccordionItem value="item-1">...</AccordionItem>
+</Accordion>
+```
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.claude/skills/shadcn/rules/composition.md
+SIZE: 4.36 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Component Composition
+
+## Contents
+
+- Items always inside their Group component
+- Callouts use Alert
+- Empty states use Empty component
+- Toast notifications use sonner
+- Choosing between overlay components
+- Dialog, Sheet, and Drawer always need a Title
+- Card structure
+- Button has no isPending or isLoading prop
+- TabsTrigger must be inside TabsList
+- Avatar always needs AvatarFallback
+- Use Separator instead of raw hr or border divs
+- Use Skeleton for loading placeholders
+- Use Badge instead of custom styled spans
+
+---
+
+## Items always inside their Group component
+
+Never render items directly inside the content container.
+
+**Incorrect:**
+
+```tsx
+<SelectContent>
+  <SelectItem value="apple">Apple</SelectItem>
+  <SelectItem value="banana">Banana</SelectItem>
+</SelectContent>
+```
+
+**Correct:**
+
+```tsx
+<SelectContent>
+  <SelectGroup>
+    <SelectItem value="apple">Apple</SelectItem>
+    <SelectItem value="banana">Banana</SelectItem>
+  </SelectGroup>
+</SelectContent>
+```
+
+This applies to all group-based components:
+
+| Item | Group |
+|------|-------|
+| `SelectItem`, `SelectLabel` | `SelectGroup` |
+| `DropdownMenuItem`, `DropdownMenuLabel`, `DropdownMenuSub` | `DropdownMenuGroup` |
+| `MenubarItem` | `MenubarGroup` |
+| `ContextMenuItem` | `ContextMenuGroup` |
+| `CommandItem` | `CommandGroup` |
+
+---
+
+## Callouts use Alert
+
+```tsx
+<Alert>
+  <AlertTitle>Warning</AlertTitle>
+  <AlertDescription>Something needs attention.</AlertDescription>
+</Alert>
+```
+
+---
+
+## Empty states use Empty component
+
+```tsx
+<Empty>
+  <EmptyHeader>
+    <EmptyMedia variant="icon"><FolderIcon /></EmptyMedia>
+    <EmptyTitle>No projects yet</EmptyTitle>
+    <EmptyDescription>Get started by creating a new project.</EmptyDescription>
+  </EmptyHeader>
+  <EmptyContent>
+    <Button>Create Project</Button>
+  </EmptyContent>
+</Empty>
+```
+
+---
+
+## Toast notifications use sonner
+
+```tsx
+import { toast } from "sonner"
+
+toast.success("Changes saved.")
+toast.error("Something went wrong.")
+toast("File deleted.", {
+  action: { label: "Undo", onClick: () => undoDelete() },
+})
+```
+
+---
+
+## Choosing between overlay components
+
+| Use case | Component |
+|----------|-----------|
+| Focused task that requires input | `Dialog` |
+| Destructive action confirmation | `AlertDialog` |
+| Side panel with details or filters | `Sheet` |
+| Mobile-first bottom panel | `Drawer` |
+| Quick info on hover | `HoverCard` |
+| Small contextual content on click | `Popover` |
+
+---
+
+## Dialog, Sheet, and Drawer always need a Title
+
+`DialogTitle`, `SheetTitle`, `DrawerTitle` are required for accessibility. Use `className="sr-only"` if visually hidden.
+
+```tsx
+<DialogContent>
+  <DialogHeader>
+    <DialogTitle>Edit Profile</DialogTitle>
+    <DialogDescription>Update your profile.</DialogDescription>
+  </DialogHeader>
+  ...
+</DialogContent>
+```
+
+---
+
+## Card structure
+
+Use full composition — don't dump everything into `CardContent`:
+
+```tsx
+<Card>
+  <CardHeader>
+    <CardTitle>Team Members</CardTitle>
+    <CardDescription>Manage your team.</CardDescription>
+  </CardHeader>
+  <CardContent>...</CardContent>
+  <CardFooter>
+    <Button>Invite</Button>
+  </CardFooter>
+</Card>
+```
+
+---
+
+## Button has no isPending or isLoading prop
+
+Compose with `Spinner` + `data-icon` + `disabled`:
+
+```tsx
+<Button disabled>
+  <Spinner data-icon="inline-start" />
+  Saving...
+</Button>
+```
+
+---
+
+## TabsTrigger must be inside TabsList
+
+Never render `TabsTrigger` directly inside `Tabs` — always wrap in `TabsList`:
+
+```tsx
+<Tabs defaultValue="account">
+  <TabsList>
+    <TabsTrigger value="account">Account</TabsTrigger>
+    <TabsTrigger value="password">Password</TabsTrigger>
+  </TabsList>
+  <TabsContent value="account">...</TabsContent>
+</Tabs>
+```
+
+---
+
+## Avatar always needs AvatarFallback
+
+Always include `AvatarFallback` for when the image fails to load:
+
+```tsx
+<Avatar>
+  <AvatarImage src="/avatar.png" alt="User" />
+  <AvatarFallback>JD</AvatarFallback>
+</Avatar>
+```
+
+---
+
+## Use existing components instead of custom markup
+
+| Instead of | Use |
+|---|---|
+| `<hr>` or `<div className="border-t">` | `<Separator />` |
+| `<div className="animate-pulse">` with styled divs | `<Skeleton className="h-4 w-3/4" />` |
+| `<span className="rounded-full bg-green-100 ...">` | `<Badge variant="secondary">` |
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.claude/skills/shadcn/rules/forms.md
+SIZE: 4.93 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Forms & Inputs
+
+## Contents
+
+- Forms use FieldGroup + Field
+- InputGroup requires InputGroupInput/InputGroupTextarea
+- Buttons inside inputs use InputGroup + InputGroupAddon
+- Option sets (2–7 choices) use ToggleGroup
+- FieldSet + FieldLegend for grouping related fields
+- Field validation and disabled states
+
+---
+
+## Forms use FieldGroup + Field
+
+Always use `FieldGroup` + `Field` — never raw `div` with `space-y-*`:
+
+```tsx
+<FieldGroup>
+  <Field>
+    <FieldLabel htmlFor="email">Email</FieldLabel>
+    <Input id="email" type="email" />
+  </Field>
+  <Field>
+    <FieldLabel htmlFor="password">Password</FieldLabel>
+    <Input id="password" type="password" />
+  </Field>
+</FieldGroup>
+```
+
+Use `Field orientation="horizontal"` for settings pages. Use `FieldLabel className="sr-only"` for visually hidden labels.
+
+**Choosing form controls:**
+
+- Simple text input → `Input`
+- Dropdown with predefined options → `Select`
+- Searchable dropdown → `Combobox`
+- Native HTML select (no JS) → `native-select`
+- Boolean toggle → `Switch` (for settings) or `Checkbox` (for forms)
+- Single choice from few options → `RadioGroup`
+- Toggle between 2–5 options → `ToggleGroup` + `ToggleGroupItem`
+- OTP/verification code → `InputOTP`
+- Multi-line text → `Textarea`
+
+---
+
+## InputGroup requires InputGroupInput/InputGroupTextarea
+
+Never use raw `Input` or `Textarea` inside an `InputGroup`.
+
+**Incorrect:**
+
+```tsx
+<InputGroup>
+  <Input placeholder="Search..." />
+</InputGroup>
+```
+
+**Correct:**
+
+```tsx
+import { InputGroup, InputGroupInput } from "@/components/ui/input-group"
+
+<InputGroup>
+  <InputGroupInput placeholder="Search..." />
+</InputGroup>
+```
+
+---
+
+## Buttons inside inputs use InputGroup + InputGroupAddon
+
+Never place a `Button` directly inside or adjacent to an `Input` with custom positioning.
+
+**Incorrect:**
+
+```tsx
+<div className="relative">
+  <Input placeholder="Search..." className="pr-10" />
+  <Button className="absolute right-0 top-0" size="icon">
+    <SearchIcon />
+  </Button>
+</div>
+```
+
+**Correct:**
+
+```tsx
+import { InputGroup, InputGroupInput, InputGroupAddon } from "@/components/ui/input-group"
+
+<InputGroup>
+  <InputGroupInput placeholder="Search..." />
+  <InputGroupAddon>
+    <Button size="icon">
+      <SearchIcon data-icon="inline-start" />
+    </Button>
+  </InputGroupAddon>
+</InputGroup>
+```
+
+---
+
+## Option sets (2–7 choices) use ToggleGroup
+
+Don't manually loop `Button` components with active state.
+
+**Incorrect:**
+
+```tsx
+const [selected, setSelected] = useState("daily")
+
+<div className="flex gap-2">
+  {["daily", "weekly", "monthly"].map((option) => (
+    <Button
+      key={option}
+      variant={selected === option ? "default" : "outline"}
+      onClick={() => setSelected(option)}
+    >
+      {option}
+    </Button>
+  ))}
+</div>
+```
+
+**Correct:**
+
+```tsx
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+
+<ToggleGroup spacing={2}>
+  <ToggleGroupItem value="daily">Daily</ToggleGroupItem>
+  <ToggleGroupItem value="weekly">Weekly</ToggleGroupItem>
+  <ToggleGroupItem value="monthly">Monthly</ToggleGroupItem>
+</ToggleGroup>
+```
+
+Combine with `Field` for labelled toggle groups:
+
+```tsx
+<Field orientation="horizontal">
+  <FieldTitle id="theme-label">Theme</FieldTitle>
+  <ToggleGroup aria-labelledby="theme-label" spacing={2}>
+    <ToggleGroupItem value="light">Light</ToggleGroupItem>
+    <ToggleGroupItem value="dark">Dark</ToggleGroupItem>
+    <ToggleGroupItem value="system">System</ToggleGroupItem>
+  </ToggleGroup>
+</Field>
+```
+
+> **Note:** `defaultValue` and `type`/`multiple` props differ between base and radix. See [base-vs-radix.md](./base-vs-radix.md#togglegroup).
+
+---
+
+## FieldSet + FieldLegend for grouping related fields
+
+Use `FieldSet` + `FieldLegend` for related checkboxes, radios, or switches — not `div` with a heading:
+
+```tsx
+<FieldSet>
+  <FieldLegend variant="label">Preferences</FieldLegend>
+  <FieldDescription>Select all that apply.</FieldDescription>
+  <FieldGroup className="gap-3">
+    <Field orientation="horizontal">
+      <Checkbox id="dark" />
+      <FieldLabel htmlFor="dark" className="font-normal">Dark mode</FieldLabel>
+    </Field>
+  </FieldGroup>
+</FieldSet>
+```
+
+---
+
+## Field validation and disabled states
+
+Both attributes are needed — `data-invalid`/`data-disabled` styles the field (label, description), while `aria-invalid`/`disabled` styles the control.
+
+```tsx
+// Invalid.
+<Field data-invalid>
+  <FieldLabel htmlFor="email">Email</FieldLabel>
+  <Input id="email" aria-invalid />
+  <FieldDescription>Invalid email address.</FieldDescription>
+</Field>
+
+// Disabled.
+<Field data-disabled>
+  <FieldLabel htmlFor="email">Email</FieldLabel>
+  <Input id="email" disabled />
+</Field>
+```
+
+Works for all controls: `Input`, `Textarea`, `Select`, `Checkbox`, `RadioGroupItem`, `Switch`, `Slider`, `NativeSelect`, `InputOTP`.
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.claude/skills/shadcn/rules/icons.md
+SIZE: 2.01 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Icons
+
+**Always use the project's configured `iconLibrary` for imports.** Check the `iconLibrary` field from project context: `lucide` → `lucide-react`, `tabler` → `@tabler/icons-react`, etc. Never assume `lucide-react`.
+
+---
+
+## Icons in Button use data-icon attribute
+
+Add `data-icon="inline-start"` (prefix) or `data-icon="inline-end"` (suffix) to the icon. No sizing classes on the icon.
+
+**Incorrect:**
+
+```tsx
+<Button>
+  <SearchIcon className="mr-2 size-4" />
+  Search
+</Button>
+```
+
+**Correct:**
+
+```tsx
+<Button>
+  <SearchIcon data-icon="inline-start"/>
+  Search
+</Button>
+
+<Button>
+  Next
+  <ArrowRightIcon data-icon="inline-end"/>
+</Button>
+```
+
+---
+
+## No sizing classes on icons inside components
+
+Components handle icon sizing via CSS. Don't add `size-4`, `w-4 h-4`, or other sizing classes to icons inside `Button`, `DropdownMenuItem`, `Alert`, `Sidebar*`, or other shadcn components. Unless the user explicitly asks for custom icon sizes.
+
+**Incorrect:**
+
+```tsx
+<Button>
+  <SearchIcon className="size-4" data-icon="inline-start" />
+  Search
+</Button>
+
+<DropdownMenuItem>
+  <SettingsIcon className="mr-2 size-4" />
+  Settings
+</DropdownMenuItem>
+```
+
+**Correct:**
+
+```tsx
+<Button>
+  <SearchIcon data-icon="inline-start" />
+  Search
+</Button>
+
+<DropdownMenuItem>
+  <SettingsIcon />
+  Settings
+</DropdownMenuItem>
+```
+
+---
+
+## Pass icons as component objects, not string keys
+
+Use `icon={CheckIcon}`, not a string key to a lookup map.
+
+**Incorrect:**
+
+```tsx
+const iconMap = {
+  check: CheckIcon,
+  alert: AlertIcon,
+}
+
+function StatusBadge({ icon }: { icon: string }) {
+  const Icon = iconMap[icon]
+  return <Icon />
+}
+
+<StatusBadge icon="check" />
+```
+
+**Correct:**
+
+```tsx
+// Import from the project's configured iconLibrary (e.g. lucide-react, @tabler/icons-react).
+import { CheckIcon } from "lucide-react"
+
+function StatusBadge({ icon: Icon }: { icon: React.ComponentType }) {
+  return <Icon />
+}
+
+<StatusBadge icon={CheckIcon} />
+```
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.claude/skills/shadcn/rules/styling.md
+SIZE: 3.86 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Styling & Customization
+
+See [customization.md](../customization.md) for theming, CSS variables, and adding custom colors.
+
+## Contents
+
+- Semantic colors
+- Built-in variants first
+- className for layout only
+- No space-x-* / space-y-*
+- Prefer size-* over w-* h-* when equal
+- Prefer truncate shorthand
+- No manual dark: color overrides
+- Use cn() for conditional classes
+- No manual z-index on overlay components
+
+---
+
+## Semantic colors
+
+**Incorrect:**
+
+```tsx
+<div className="bg-blue-500 text-white">
+  <p className="text-gray-600">Secondary text</p>
+</div>
+```
+
+**Correct:**
+
+```tsx
+<div className="bg-primary text-primary-foreground">
+  <p className="text-muted-foreground">Secondary text</p>
+</div>
+```
+
+---
+
+## No raw color values for status/state indicators
+
+For positive, negative, or status indicators, use Badge variants, semantic tokens like `text-destructive`, or define custom CSS variables — don't reach for raw Tailwind colors.
+
+**Incorrect:**
+
+```tsx
+<span className="text-emerald-600">+20.1%</span>
+<span className="text-green-500">Active</span>
+<span className="text-red-600">-3.2%</span>
+```
+
+**Correct:**
+
+```tsx
+<Badge variant="secondary">+20.1%</Badge>
+<Badge>Active</Badge>
+<span className="text-destructive">-3.2%</span>
+```
+
+If you need a success/positive color that doesn't exist as a semantic token, use a Badge variant or ask the user about adding a custom CSS variable to the theme (see [customization.md](../customization.md)).
+
+---
+
+## Built-in variants first
+
+**Incorrect:**
+
+```tsx
+<Button className="border border-input bg-transparent hover:bg-accent">
+  Click me
+</Button>
+```
+
+**Correct:**
+
+```tsx
+<Button variant="outline">Click me</Button>
+```
+
+---
+
+## className for layout only
+
+Use `className` for layout (e.g. `max-w-md`, `mx-auto`, `mt-4`), **not** for overriding component colors or typography. To change colors, use semantic tokens, built-in variants, or CSS variables.
+
+**Incorrect:**
+
+```tsx
+<Card className="bg-blue-100 text-blue-900 font-bold">
+  <CardContent>Dashboard</CardContent>
+</Card>
+```
+
+**Correct:**
+
+```tsx
+<Card className="max-w-md mx-auto">
+  <CardContent>Dashboard</CardContent>
+</Card>
+```
+
+To customize a component's appearance, prefer these approaches in order:
+1. **Built-in variants** — `variant="outline"`, `variant="destructive"`, etc.
+2. **Semantic color tokens** — `bg-primary`, `text-muted-foreground`.
+3. **CSS variables** — define custom colors in the global CSS file (see [customization.md](../customization.md)).
+
+---
+
+## No space-x-* / space-y-*
+
+Use `gap-*` instead. `space-y-4` → `flex flex-col gap-4`. `space-x-2` → `flex gap-2`.
+
+```tsx
+<div className="flex flex-col gap-4">
+  <Input />
+  <Input />
+  <Button>Submit</Button>
+</div>
+```
+
+---
+
+## Prefer size-* over w-* h-* when equal
+
+`size-10` not `w-10 h-10`. Applies to icons, avatars, skeletons, etc.
+
+---
+
+## Prefer truncate shorthand
+
+`truncate` not `overflow-hidden text-ellipsis whitespace-nowrap`.
+
+---
+
+## No manual dark: color overrides
+
+Use semantic tokens — they handle light/dark via CSS variables. `bg-background text-foreground` not `bg-white dark:bg-gray-950`.
+
+---
+
+## Use cn() for conditional classes
+
+Use the `cn()` utility from the project for conditional or merged class names. Don't write manual ternaries in className strings.
+
+**Incorrect:**
+
+```tsx
+<div className={`flex items-center ${isActive ? "bg-primary text-primary-foreground" : "bg-muted"}`}>
+```
+
+**Correct:**
+
+```tsx
+import { cn } from "@/lib/utils"
+
+<div className={cn("flex items-center", isActive ? "bg-primary text-primary-foreground" : "bg-muted")}>
+```
+
+---
+
+## No manual z-index on overlay components
+
+`Dialog`, `Sheet`, `Drawer`, `AlertDialog`, `DropdownMenu`, `Popover`, `Tooltip`, `HoverCard` handle their own stacking. Never add `z-50` or `z-[999]`.
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/.claude/skills/shadcn/SKILL.md
+SIZE: 16.65 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+---
+name: shadcn
+description: Manages shadcn components and projects — adding, searching, fixing, debugging, styling, and composing UI. Provides project context, component docs, and usage examples. Applies when working with shadcn/ui, component registries, presets, --preset codes, or any project with a components.json file. Also triggers for "shadcn init", "create an app with --preset", or "switch to --preset".
+user-invocable: false
+allowed-tools: Bash(npx shadcn@latest *), Bash(pnpm dlx shadcn@latest *), Bash(bunx --bun shadcn@latest *)
+---
+
+# shadcn/ui
+
+A framework for building ui, components and design systems. Components are added as source code to the user's project via the CLI.
+
+> **IMPORTANT:** Run all CLI commands using the project's package runner: `npx shadcn@latest`, `pnpm dlx shadcn@latest`, or `bunx --bun shadcn@latest` — based on the project's `packageManager`. Examples below use `npx shadcn@latest` but substitute the correct runner for the project.
+
+## Current Project Context
+
+```json
+!`npx shadcn@latest info --json`
+```
+
+The JSON above contains the project config and installed components. Use `npx shadcn@latest docs <component>` to get documentation and example URLs for any component.
+
+## Principles
+
+1. **Use existing components first.** Use `npx shadcn@latest search` to check registries before writing custom UI. Check community registries too.
+2. **Compose, don't reinvent.** Settings page = Tabs + Card + form controls. Dashboard = Sidebar + Card + Chart + Table.
+3. **Use built-in variants before custom styles.** `variant="outline"`, `size="sm"`, etc.
+4. **Use semantic colors.** `bg-primary`, `text-muted-foreground` — never raw values like `bg-blue-500`.
+
+## Critical Rules
+
+These rules are **always enforced**. Each links to a file with Incorrect/Correct code pairs.
+
+### Styling & Tailwind → [styling.md](./rules/styling.md)
+
+- **`className` for layout, not styling.** Never override component colors or typography.
+- **No `space-x-*` or `space-y-*`.** Use `flex` with `gap-*`. For vertical stacks, `flex flex-col gap-*`.
+- **Use `size-*` when width and height are equal.** `size-10` not `w-10 h-10`.
+- **Use `truncate` shorthand.** Not `overflow-hidden text-ellipsis whitespace-nowrap`.
+- **No manual `dark:` color overrides.** Use semantic tokens (`bg-background`, `text-muted-foreground`).
+- **Use `cn()` for conditional classes.** Don't write manual template literal ternaries.
+- **No manual `z-index` on overlay components.** Dialog, Sheet, Popover, etc. handle their own stacking.
+
+### Forms & Inputs → [forms.md](./rules/forms.md)
+
+- **Forms use `FieldGroup` + `Field`.** Never use raw `div` with `space-y-*` or `grid gap-*` for form layout.
+- **`InputGroup` uses `InputGroupInput`/`InputGroupTextarea`.** Never raw `Input`/`Textarea` inside `InputGroup`.
+- **Buttons inside inputs use `InputGroup` + `InputGroupAddon`.**
+- **Option sets (2–7 choices) use `ToggleGroup`.** Don't loop `Button` with manual active state.
+- **`FieldSet` + `FieldLegend` for grouping related checkboxes/radios.** Don't use a `div` with a heading.
+- **Field validation uses `data-invalid` + `aria-invalid`.** `data-invalid` on `Field`, `aria-invalid` on the control. For disabled: `data-disabled` on `Field`, `disabled` on the control.
+
+### Component Structure → [composition.md](./rules/composition.md)
+
+- **Items always inside their Group.** `SelectItem` → `SelectGroup`. `DropdownMenuItem` → `DropdownMenuGroup`. `CommandItem` → `CommandGroup`.
+- **Use `asChild` (radix) or `render` (base) for custom triggers.** Check `base` field from `npx shadcn@latest info`. → [base-vs-radix.md](./rules/base-vs-radix.md)
+- **Dialog, Sheet, and Drawer always need a Title.** `DialogTitle`, `SheetTitle`, `DrawerTitle` required for accessibility. Use `className="sr-only"` if visually hidden.
+- **Use full Card composition.** `CardHeader`/`CardTitle`/`CardDescription`/`CardContent`/`CardFooter`. Don't dump everything in `CardContent`.
+- **Button has no `isPending`/`isLoading`.** Compose with `Spinner` + `data-icon` + `disabled`.
+- **`TabsTrigger` must be inside `TabsList`.** Never render triggers directly in `Tabs`.
+- **`Avatar` always needs `AvatarFallback`.** For when the image fails to load.
+
+### Use Components, Not Custom Markup → [composition.md](./rules/composition.md)
+
+- **Use existing components before custom markup.** Check if a component exists before writing a styled `div`.
+- **Callouts use `Alert`.** Don't build custom styled divs.
+- **Empty states use `Empty`.** Don't build custom empty state markup.
+- **Toast via `sonner`.** Use `toast()` from `sonner`.
+- **Use `Separator`** instead of `<hr>` or `<div className="border-t">`.
+- **Use `Skeleton`** for loading placeholders. No custom `animate-pulse` divs.
+- **Use `Badge`** instead of custom styled spans.
+
+### Icons → [icons.md](./rules/icons.md)
+
+- **Icons in `Button` use `data-icon`.** `data-icon="inline-start"` or `data-icon="inline-end"` on the icon.
+- **No sizing classes on icons inside components.** Components handle icon sizing via CSS. No `size-4` or `w-4 h-4`.
+- **Pass icons as objects, not string keys.** `icon={CheckIcon}`, not a string lookup.
+
+### CLI
+
+- **Never decode or fetch preset codes manually.** Pass them directly to `npx shadcn@latest apply --preset <code>` for existing projects, or `npx shadcn@latest init --preset <code>` when initializing.
+
+## Key Patterns
+
+These are the most common patterns that differentiate correct shadcn/ui code. For edge cases, see the linked rule files above.
+
+```tsx
+// Form layout: FieldGroup + Field, not div + Label.
+<FieldGroup>
+  <Field>
+    <FieldLabel htmlFor="email">Email</FieldLabel>
+    <Input id="email" />
+  </Field>
+</FieldGroup>
+
+// Validation: data-invalid on Field, aria-invalid on the control.
+<Field data-invalid>
+  <FieldLabel>Email</FieldLabel>
+  <Input aria-invalid />
+  <FieldDescription>Invalid email.</FieldDescription>
+</Field>
+
+// Icons in buttons: data-icon, no sizing classes.
+<Button>
+  <SearchIcon data-icon="inline-start" />
+  Search
+</Button>
+
+// Spacing: gap-*, not space-y-*.
+<div className="flex flex-col gap-4">  // correct
+<div className="space-y-4">           // wrong
+
+// Equal dimensions: size-*, not w-* h-*.
+<Avatar className="size-10">   // correct
+<Avatar className="w-10 h-10"> // wrong
+
+// Status colors: Badge variants or semantic tokens, not raw colors.
+<Badge variant="secondary">+20.1%</Badge>    // correct
+<span className="text-emerald-600">+20.1%</span> // wrong
+```
+
+## Component Selection
+
+| Need                       | Use                                                                                                 |
+| -------------------------- | --------------------------------------------------------------------------------------------------- |
+| Button/action              | `Button` with appropriate variant                                                                   |
+| Form inputs                | `Input`, `Select`, `Combobox`, `Switch`, `Checkbox`, `RadioGroup`, `Textarea`, `InputOTP`, `Slider` |
+| Toggle between 2–5 options | `ToggleGroup` + `ToggleGroupItem`                                                                   |
+| Data display               | `Table`, `Card`, `Badge`, `Avatar`                                                                  |
+| Navigation                 | `Sidebar`, `NavigationMenu`, `Breadcrumb`, `Tabs`, `Pagination`                                     |
+| Overlays                   | `Dialog` (modal), `Sheet` (side panel), `Drawer` (bottom sheet), `AlertDialog` (confirmation)       |
+| Feedback                   | `sonner` (toast), `Alert`, `Progress`, `Skeleton`, `Spinner`                                        |
+| Command palette            | `Command` inside `Dialog`                                                                           |
+| Charts                     | `Chart` (wraps Recharts)                                                                            |
+| Layout                     | `Card`, `Separator`, `Resizable`, `ScrollArea`, `Accordion`, `Collapsible`                          |
+| Empty states               | `Empty`                                                                                             |
+| Menus                      | `DropdownMenu`, `ContextMenu`, `Menubar`                                                            |
+| Tooltips/info              | `Tooltip`, `HoverCard`, `Popover`                                                                   |
+
+## Key Fields
+
+The injected project context contains these key fields:
+
+- **`aliases`** → use the actual alias prefix for imports (e.g. `@/`, `~/`), never hardcode.
+- **`isRSC`** → when `true`, components using `useState`, `useEffect`, event handlers, or browser APIs need `"use client"` at the top of the file. Always reference this field when advising on the directive.
+- **`tailwindVersion`** → `"v4"` uses `@theme inline` blocks; `"v3"` uses `tailwind.config.js`.
+- **`tailwindCssFile`** → the global CSS file where custom CSS variables are defined. Always edit this file, never create a new one.
+- **`style`** → component visual treatment (e.g. `nova`, `vega`).
+- **`base`** → primitive library (`radix` or `base`). Affects component APIs and available props.
+- **`iconLibrary`** → determines icon imports. Use `lucide-react` for `lucide`, `@tabler/icons-react` for `tabler`, etc. Never assume `lucide-react`.
+- **`resolvedPaths`** → exact file-system destinations for components, utils, hooks, etc.
+- **`framework`** → routing and file conventions (e.g. Next.js App Router vs Vite SPA).
+- **`packageManager`** → use this for any non-shadcn dependency installs (e.g. `pnpm add date-fns` vs `npm install date-fns`).
+
+See [cli.md — `info` command](./cli.md) for the full field reference.
+
+## Component Docs, Examples, and Usage
+
+Run `npx shadcn@latest docs <component>` to get the URLs for a component's documentation, examples, and API reference. Fetch these URLs to get the actual content.
+
+```bash
+npx shadcn@latest docs button dialog select
+```
+
+**When creating, fixing, debugging, or using a component, always run `npx shadcn@latest docs` and fetch the URLs first.** This ensures you're working with the correct API and usage patterns rather than guessing.
+
+## Workflow
+
+1. **Get project context** — already injected above. Run `npx shadcn@latest info` again if you need to refresh.
+2. **Check installed components first** — before running `add`, always check the `components` list from project context or list the `resolvedPaths.ui` directory. Don't import components that haven't been added, and don't re-add ones already installed.
+3. **Find components** — `npx shadcn@latest search`.
+4. **Get docs and examples** — run `npx shadcn@latest docs <component>` to get URLs, then fetch them. Use `npx shadcn@latest view` to browse registry items you haven't installed. To preview changes to installed components, use `npx shadcn@latest add --diff`.
+5. **Install or update** — `npx shadcn@latest add`. When updating existing components, use `--dry-run` and `--diff` to preview changes first (see [Updating Components](#updating-components) below).
+6. **Fix imports in third-party components** — After adding components from community registries (e.g. `@bundui`, `@magicui`), check the added non-UI files for hardcoded import paths like `@/components/ui/...`. These won't match the project's actual aliases. Use `npx shadcn@latest info` to get the correct `ui` alias (e.g. `@workspace/ui/components`) and rewrite the imports accordingly. The CLI rewrites imports for its own UI files, but third-party registry components may use default paths that don't match the project.
+7. **Review added components** — After adding a component or block from any registry, **always read the added files and verify they are correct**. Check for missing sub-components (e.g. `SelectItem` without `SelectGroup`), missing imports, incorrect composition, or violations of the [Critical Rules](#critical-rules). Also replace any icon imports with the project's `iconLibrary` from the project context (e.g. if the registry item uses `lucide-react` but the project uses `hugeicons`, swap the imports and icon names accordingly). Fix all issues before moving on.
+8. **Registry must be explicit** — When the user asks to add a block or component, **do not guess the registry**. If no registry is specified (e.g. user says "add a login block" without specifying `@shadcn`, `@tailark`, etc.), ask which registry to use. Never default to a registry on behalf of the user.
+9. **Switching presets** — Ask the user first: **overwrite**, **merge**, or **skip**?
+   - **Overwrite**: `npx shadcn@latest apply --preset <code>`. Overwrites detected components, fonts, and CSS variables.
+   - **Merge**: `npx shadcn@latest init --preset <code> --force --no-reinstall`, then run `npx shadcn@latest info` to list installed components, then for each installed component use `--dry-run` and `--diff` to [smart merge](#updating-components) it individually.
+   - **Skip**: `npx shadcn@latest init --preset <code> --force --no-reinstall`. Only updates config and CSS, leaves components as-is.
+   - **Important**: Always run preset commands inside the user's project directory. `apply` only works in an existing project with a `components.json` file. The CLI automatically preserves the current base (`base` vs `radix`) from `components.json`. If you must use a scratch/temp directory (e.g. for `--dry-run` comparisons), pass `--base <current-base>` explicitly — preset codes do not encode the base.
+
+## Updating Components
+
+When the user asks to update a component from upstream while keeping their local changes, use `--dry-run` and `--diff` to intelligently merge. **NEVER fetch raw files from GitHub manually — always use the CLI.**
+
+1. Run `npx shadcn@latest add <component> --dry-run` to see all files that would be affected.
+2. For each file, run `npx shadcn@latest add <component> --diff <file>` to see what changed upstream vs local.
+3. Decide per file based on the diff:
+   - No local changes → safe to overwrite.
+   - Has local changes → read the local file, analyze the diff, and apply upstream updates while preserving local modifications.
+   - User says "just update everything" → use `--overwrite`, but confirm first.
+4. **Never use `--overwrite` without the user's explicit approval.**
+
+## Quick Reference
+
+```bash
+# Create a new project.
+npx shadcn@latest init --name my-app --preset base-nova
+npx shadcn@latest init --name my-app --preset a2r6bw --template vite
+
+# Create a monorepo project.
+npx shadcn@latest init --name my-app --preset base-nova --monorepo
+npx shadcn@latest init --name my-app --preset base-nova --template next --monorepo
+
+# Initialize existing project.
+npx shadcn@latest init --preset base-nova
+npx shadcn@latest init --defaults  # shortcut: --template=next --preset=nova (base style implied)
+
+# Apply a preset to an existing project.
+npx shadcn@latest apply --preset a2r6bw
+npx shadcn@latest apply a2r6bw
+
+# Add components.
+npx shadcn@latest add button card dialog
+npx shadcn@latest add @magicui/shimmer-button
+npx shadcn@latest add --all
+
+# Preview changes before adding/updating.
+npx shadcn@latest add button --dry-run
+npx shadcn@latest add button --diff button.tsx
+npx shadcn@latest add @acme/form --view button.tsx
+
+# Search registries.
+npx shadcn@latest search @shadcn -q "sidebar"
+npx shadcn@latest search @tailark -q "stats"
+
+# Get component docs and example URLs.
+npx shadcn@latest docs button dialog select
+
+# View registry item details (for items not yet installed).
+npx shadcn@latest view @shadcn/button
+```
+
+**Named presets:** `nova`, `vega`, `maia`, `lyra`, `mira`, `luma`
+**Templates:** `next`, `vite`, `start`, `react-router`, `astro` (all support `--monorepo`) and `laravel` (not supported for monorepo)
+**Preset codes:** Version-prefixed base62 strings (e.g. `a2r6bw` or `b0`), from [ui.shadcn.com](https://ui.shadcn.com).
+
+## Detailed References
+
+- [rules/forms.md](./rules/forms.md) — FieldGroup, Field, InputGroup, ToggleGroup, FieldSet, validation states
+- [rules/composition.md](./rules/composition.md) — Groups, overlays, Card, Tabs, Avatar, Alert, Empty, Toast, Separator, Skeleton, Badge, Button loading
+- [rules/icons.md](./rules/icons.md) — data-icon, icon sizing, passing icons as objects
+- [rules/styling.md](./rules/styling.md) — Semantic colors, variants, className, spacing, size, truncate, dark mode, cn(), z-index
+- [rules/base-vs-radix.md](./rules/base-vs-radix.md) — asChild vs render, Select, ToggleGroup, Slider, Accordion
+- [cli.md](./cli.md) — Commands, flags, presets, templates
+- [customization.md](./customization.md) — Theming, CSS variables, extending components
+
+
+
+================================================================================
 FILE: src/AppointMe.Frontend/.gitignore
 SIZE: 0.5 KB
 MODIFIED: 06/11/2026 13:31:28
@@ -9123,6 +13537,226 @@ dist-ssr
 
 # Claude code settings
 .claude/settings.local.json
+
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/CLAUDE.md
+SIZE: 11.13 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# CLAUDE.md — AppointMe Frontend
+
+Guidance for Claude Code (claude.ai/code) when working with the AppointMe React/TypeScript frontend. This file is scoped to `src/AppointMe.Frontend/`. The repo root has its own `CLAUDE.md` for backend conventions — read both when a task spans the stack.
+
+## Build and Development Commands
+
+```bash
+yarn dev               # Vite dev server on https://localhost:5173 (mkcert auto-HTTPS)
+yarn build             # tsc -b + Vite production build
+yarn lint              # ESLint over src/
+yarn generate:api      # Regenerate API client from backend OpenAPI (needs Aspire up)
+```
+
+**Type-check from CI/scripts**:
+```bash
+yarn tsc --noEmit --ignoreDeprecations 6.0
+```
+The `--ignoreDeprecations 6.0` flag silences a pre-existing `baseUrl` deprecation warning in `tsconfig.json`. Without it, `tsc --noEmit` fails on that warning even when there are no actual type errors.
+
+**API regeneration**: `yarn generate:api` calls orval which fetches `https://localhost:7233/openapi/v1.json`. The backend must be running via Aspire (`cd src/AppointMe.Aspire && dotnet run` from the repo root). `NODE_TLS_REJECT_UNAUTHORIZED=0` is set in the script because mkcert certs are self-signed.
+
+## Architecture
+
+### Folder layout
+
+```
+src/
+├── api/                # Generated by orval — DO NOT hand-edit
+│   ├── appointme.ts          # query/mutation hooks
+│   └── appointme.schemas.ts  # TypeScript types
+├── app/                # Route-level pages and layouts
+│   ├── <feature>/            # Vertical slice per feature (appointments, customers, team, …)
+│   │   ├── <feature>.tsx     # page entry (route component)
+│   │   ├── index.ts          # barrel — exports the page
+│   │   └── <action>/         # one folder per user action (verb-first)
+│   │       ├── <action>-dialog.tsx
+│   │       └── index.ts
+│   ├── layouts/, router/, providers/, auth/, onboarding/, not-found/
+├── components/
+│   ├── ui/             # shadcn primitives (vendored, treat as semi-third-party)
+│   ├── format/         # Date/time/timezone system (see below)
+│   ├── auth/           # current-user / current-company contexts, <Can>
+│   ├── modal-dialog/   # programmatic modal system
+│   ├── error/, onboarding/, …
+├── hooks/              # global hooks (use-mobile.ts, …)
+├── lib/
+│   ├── axios.ts        # axios instance + X-Company-Id interceptor + 401 redirect
+│   ├── utils.ts        # cn() — clsx + tailwind-merge
+│   └── query-client.ts
+└── assets/             # static images
+```
+
+### Vertical slice convention (mirrors the backend)
+
+Each feature folder under `app/` has the route page at its root and one sub-folder per **user action**. Action folders are verb-first (`schedule-appointment/`, `reschedule-appointment/`, `cancel-appointment/`). Read-view concerns (the calendar) live alongside the page as their own slice folder (`calendar/`). See `app/appointments/` for the canonical example.
+
+Slice contents typically include: the dialog/form component, its zod schema (co-located), any slice-private hooks. Cross-slice helpers stay at the feature root, not inside any one slice.
+
+### Component split rule (fast refresh)
+
+ESLint enforces `react-refresh/only-export-components`. A `.tsx` file must export **only** React components. Hooks, types, constants, and plain functions go in sibling `.ts` files. Pattern in use:
+
+- `formatted-date.tsx` (component) + `use-formatted-date.ts` (hook + `DateFormat` type + internal formatters).
+- `calendar.tsx` (component) + `calendar-config.ts` (`ViewKey`, `VIEW_MAP`).
+
+If you add a helper to a `.tsx` file the lint warning fires and HMR drops to full reload.
+
+## Key Patterns
+
+### Data fetching — orval + TanStack Query
+
+All API calls go through orval-generated hooks in `src/api/appointme.ts`:
+
+```ts
+const { data: appointments } = useGetAppointments(dateRange);
+const { mutateAsync: schedule } = useScheduleAppointment();
+await schedule({ data: { ... } });
+await queryClient.invalidateQueries({ queryKey: getGetAppointmentsQueryKey(dateRange) });
+```
+
+- Queries use `useSuspenseQuery` (orval config); route pages must sit inside `<Suspense>` (handled by `app/router/`).
+- The axios mutator (`lib/axios.ts`) injects `X-Company-Id` from `currentCompanyStore` on every request and redirects to `/auth/login` on 401.
+- All API datetimes are **UTC ISO strings**. Convert to/from company-tz wall clock for display and inputs (see Date/Time below).
+
+### Modal dialogs — programmatic API
+
+Dialogs are opened from code, not declared inline:
+
+```tsx
+const modalDialog = useModalDialog();
+const ok = await modalDialog.open<boolean>(props => (
+    <ScheduleAppointmentDialog {...props} initialDate={...} />
+));
+```
+
+The dialog component receives `{ resolve, visible }` from `IModalProps<T>`. It controls itself via `visible` and calls `resolve(value)` to close.
+
+**Radix `<Dialog>` controlled-mode quirk**: every programmatically-opened dialog needs a hidden trigger to silence Radix's "missing required child" warning:
+
+```tsx
+<Dialog open={visible} onOpenChange={open => !open && resolve(false)}>
+    <DialogTrigger asChild>
+        <button type='button' aria-hidden tabIndex={-1} className='hidden' />
+    </DialogTrigger>
+    <DialogContent>…</DialogContent>
+</Dialog>
+```
+
+**Radix `<Popover>` positioned at click coords**: use `<PopoverTrigger asChild>` wrapping a `pointer-events-none fixed` 1×1 `<span>` — Radix uses it as both trigger and anchor. See `app/appointments/calendar/appointment-preview.tsx`.
+
+### Forms — react-hook-form + zod + shadcn Field
+
+```tsx
+const formSchema = z.object({
+    date: z.string().min(1, 'Date is required'),
+    notes: z.string().max(NOTES_MAX_LENGTH, '…').optional().nullable(),
+});
+type FormValues = z.infer<typeof formSchema>;
+
+const { control, formState, handleSubmit } = useForm<FormValues>({
+    resolver: zodResolver(formSchema),
+    defaultValues: { … },
+});
+
+<Controller
+    name='date'
+    control={control}
+    render={({ field, fieldState }) => (
+        <Field data-invalid={fieldState.invalid}>
+            <FieldLabel htmlFor='date'>Date</FieldLabel>
+            <Input id='date' {...field} type='date' />
+            {fieldState.error && <FieldError errors={[fieldState.error]} />}
+        </Field>
+    )}
+/>
+```
+
+Zod schema is **co-located** with the dialog, not in a separate file. Submit buttons live in `<DialogFooter>` and submit the form via `form="<form-id>"` attribute (form sits inside `<DialogContent>`).
+
+### Auth and permissions
+
+- `useCurrentUser()` → full `GetCurrentUserResponse` (auth state, memberships).
+- `useCurrentCompany()` → current `CompanyMembership` (`companyId`, `companyName`, `timeZone`).
+- `<Can permission='appointments:schedule'>…</Can>` gates UI by permission key. Permission strings are colon-namespaced (`<resource>:<action>`).
+
+### Date / time / timezone — `components/format/`
+
+**Core rule**: API datetimes are UTC ISO. All display and form inputs render in the **company's IANA timezone**, read from `useTimeZone()`. **No `date-fns`** — built-in `Intl` only.
+
+```tsx
+// Single date / time — renders <time dateTime=…>
+<FormattedDate date={appointment.start} format='shortNoYear' />
+<FormattedDate date={appointment.start} format='time' />
+
+// Date range — renders <span>
+<FormattedDateRange from={range.from} to={range.to} />
+
+// Non-JSX call sites
+const formatDate = useFormattedDate();
+const formatRange = useFormattedDateRange();
+const timeZone = useTimeZone();
+
+// HTML form inputs
+toDateInputValue(iso, tz)              // "2026-03-05" for <input type="date">
+toTimeInputValue(iso, tz)              // "14:30"      for <input type="time">
+parseInputDateTime(date, time, tz)     // company-tz wall clock → UTC ISO
+```
+
+`DateFormat` values: `short`, `shortWithWeekday`, `shortNoYear`, `full`, `monthDay`, `month`, `weekday`, `year`, `time`, `dateTime`, `numericDate`.
+
+`<Calendar>` (the FullCalendar wrapper) takes a `timeZone` prop; without it the grid renders in browser-local time. The page does `const timeZone = useTimeZone()` and threads it down.
+
+### Routing
+
+React Router v7. Layout shell at `app/router/app-shell.tsx`, route table at `app/router/router.tsx`. Breadcrumbs and active-nav state come from route `handle` via `useBreadcrumbs()` / `useActiveNav()`. Protected routes are nested under `<CurrentCompanyProvider>` + `<UserAccessProvider>` + `<ModalDialogProvider>`.
+
+### Styling
+
+Tailwind CSS 4 via `@tailwindcss/vite`. Always use shadcn theme tokens (`bg-background`, `text-foreground`, `border-border`, `text-muted-foreground`, `text-destructive`, `bg-primary/5`, …) — never raw hex colours. Combine class names via `cn()` from `@/lib/utils`.
+
+## Naming Conventions
+
+- **Filenames**: kebab-case everywhere (`schedule-appointment-dialog.tsx`, `use-formatted-date.ts`).
+- **Components**: PascalCase exports.
+- **Hooks**: `useX` exports, `use-x.ts` filenames.
+- **Index barrels**: every feature/slice folder has an `index.ts` that exports its public surface.
+- **Permission keys**: `<resource>:<action>` (e.g., `appointments:schedule`).
+- **Indentation**: 4 spaces. Quotes: single (incl. JSX). Trailing commas everywhere. Print width 120. Enforced by Prettier with `@trivago/prettier-plugin-sort-imports` and `prettier-plugin-tailwindcss`.
+
+## Tech Stack
+
+- **React 19** + **TypeScript 6** (strict, `noUnusedLocals`, `noUnusedParameters`).
+- **Vite 8** with `@tailwindcss/vite`, `vite-plugin-svgr`, `vite-plugin-mkcert` (auto-HTTPS).
+- **Tailwind CSS 4**, **shadcn/ui** (vendored under `components/ui/`).
+- **TanStack Query 5** (suspense mode) + **orval** for OpenAPI codegen → axios mutator.
+- **React Router 7**.
+- **react-hook-form 7** + **zod 4**.
+- **FullCalendar 6** (`@fullcalendar/react` + day/time/interaction plugins).
+- **sonner** for toasts.
+- **lucide-react** for icons.
+- **Radix UI** primitives (Dialog, Popover, Select, Tabs, …) via shadcn.
+
+## Project-specific gotchas
+
+- **Don't hand-edit `src/api/appointme.ts` or `src/api/appointme.schemas.ts`** — they're regenerated by orval with `clean: true`, which overwrites everything. If the backend changes shape, run `yarn generate:api` (Aspire must be running).
+- **Don't import `date-fns`** — removed from the project. Use `Intl` and the `components/format/` helpers.
+- **Don't use the browser's local timezone for appointment display** — always go through `useTimeZone()` / `<FormattedDate>` / `parseInputDateTime`. The browser tz is only used as a fallback when no company context is loaded yet.
+- **Don't mix component and non-component exports in a `.tsx` file** — ESLint's `react-refresh/only-export-components` warns and HMR breaks. Split helpers into a sibling `.ts` file.
+- **Don't render Radix `<Dialog>` or `<Popover>` controlled-mode without a Trigger** — Radix logs a warning. Use the hidden-trigger pattern shown above.
+- **Don't use raw hex colours** — use Tailwind theme tokens so dark mode / theme changes propagate.
+- **Don't put zod schemas in shared files** — co-locate with the dialog/form that uses them.
 
 
 
@@ -25166,8 +29800,92 @@ public sealed record GetCurrentUserAccessResponse
 
 
 
+================================================================================
+FILE: THIRD-PARTY-NOTICES.md
+SIZE: 3.81 KB
+MODIFIED: 06/11/2026 13:31:28
+================================================================================
+
+# Third-Party Notices
+
+AppointMe itself is released under the [MIT License](./LICENSE). It is built on
+open-source components that remain under **their own** licenses.
+
+## Do you need to ship these license files?
+
+For the way AppointMe consumes them — as package dependencies pulled by NuGet and
+Yarn at build time — you are **not** required to copy each dependency's license
+text into this repository. Those packages travel with their own licenses through
+the package managers.
+
+The obligations apply when you **redistribute** those components, for example in a
+published binary or a Docker image. Permissive licenses (MIT, Apache-2.0, ISC,
+BSD) then require you to **preserve the original copyright and license notices**.
+This file provides that attribution and flags the one dependency with copyleft
+terms (Hangfire, LGPL-3.0) so you can make an informed choice.
+
+> This is a curated summary, not an exhaustive transitive manifest, and is not
+> legal advice. For a complete, authoritative list (including transitive
+> dependencies), generate one from the lockfiles — see
+> [Generating a complete report](#generating-a-complete-report).
+
+## Backend (.NET / NuGet)
+
+| License | Components |
+|---|---|
+| **MIT** | .NET runtime & ASP.NET Core, Entity Framework Core, `Microsoft.Extensions.*`, `Microsoft.Data.SqlClient`, `Microsoft.AspNetCore.Authentication.*`, `Microsoft.AspNetCore.OpenApi`, Asp.Versioning, .NET Aspire (`Aspire.Hosting.*`), CommunityToolkit.Aspire, `Azure.Identity`, `Azure.Extensions.AspNetCore.DataProtection.Blobs`, `Microsoft.Graph`, Bogus, Scrutor, Wolverine (`WolverineFx.*`), `Schick.Keycloak.RestApiClient`, `Microsoft.NET.Test.Sdk`, `Microsoft.Extensions.TimeProvider.Testing`, coverlet |
+| **Apache-2.0** | Dapper & `Dapper.SqlBuilder`, OpenTelemetry (`OpenTelemetry.*`), xUnit |
+| **LGPL-3.0** *(or commercial)* | Hangfire (`Hangfire.Core`, `Hangfire.AspNetCore`, `Hangfire.SqlServer`) — see note below |
+
+### Note on Hangfire (LGPL-3.0)
+
+Hangfire is dual-licensed under **LGPL-3.0** or a **commercial license**. Using it
+as an unmodified library — which is exactly how AppointMe references it (a NuGet
+package, dynamically linked) — is permitted in commercial and proprietary
+applications at no cost. The copyleft obligation is triggered only if you
+**modify Hangfire's own source**; in that case you must release those
+modifications under the LGPL or obtain a commercial license from
+[hangfire.io](https://www.hangfire.io/pricing/). Linking your own proprietary code
+against it imposes no such obligation.
+
+## Frontend (npm)
+
+| License | Components |
+|---|---|
+| **MIT** | React & React-DOM, Vite, Tailwind CSS, Radix UI (`@radix-ui/*`), TanStack (Query / Table / Pacer / Hotkeys), FullCalendar standard plugins (`@fullcalendar/*`), axios, Luxon, Zod, Recharts, react-hook-form, react-router-dom, sonner, clsx, class-variance-authority, tailwind-merge, nuqs, cmdk, vaul, embla-carousel, next-themes, orval, ESLint, Prettier |
+| **Apache-2.0** | TypeScript |
+| **ISC** | lucide-react |
+
+## Bundled local-development services (containers)
+
+Run by .NET Aspire for local development only; they are **not** redistributed as
+part of AppointMe's source:
+
+| Component | License |
+|---|---|
+| Keycloak | Apache-2.0 |
+| Mailpit | MIT |
+| Microsoft SQL Server | Microsoft proprietary EULA (Developer edition is free for development/test) |
+
+## Generating a complete report
+
+For an authoritative manifest of every dependency, including transitive ones,
+generate it from the lockfiles:
+
+```bash
+# .NET — list every package license across the solution
+dotnet tool install --global dotnet-project-licenses
+dotnet-project-licenses --input AppointMe.sln --output-format markdown
+
+# Frontend — list every npm package license
+cd src/AppointMe.Frontend
+npx license-checker-rseidelsohn --summary
+```
+
+
+
 ===============================================================================
-EXPORT COMPLETED: 06/11/2026 13:56:10
-Total Files Exported: 553
+EXPORT COMPLETED: 06/11/2026 13:59:18
+Total Files Exported: 577
 Output File: D:\DEV\personal\appointme\docs\llm\dump.txt
 ===============================================================================

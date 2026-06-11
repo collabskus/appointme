@@ -61,7 +61,7 @@ $IncludeExtensions = @(
     "cs", "json", "xml", "csproj", "slnx", "sln", "config",
     "cshtml", "razor", "js", "css", "scss", "html",
     "yml", "yaml", "sql", "props", "targets", "sh",
-    "ps1"
+    "ps1", "md"
 )
 
 # Exact filenames (no extension match needed)
