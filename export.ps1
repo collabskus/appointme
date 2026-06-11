@@ -1,15 +1,19 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Exports all git-tracked project files to a single dump file, formats the
-    code, then commits and pushes everything to origin.
+    Exports project files to a single dump file, formats the code, then commits
+    and pushes everything to origin.
 
 .DESCRIPTION
     Full workflow (each step timestamped):
       1. Push-Location into the project directory
       2. Ensure git user.name / user.email are configured (local repo scope)
       3. dotnet format (optional, skippable)
-      4. Export git-tracked files to docs/llm/dump.txt
+      4. Export files to docs/llm/dump.txt
+           - includes EVERY tracked (and untracked-but-not-ignored) file
+           - excludes only the docs/llm directory (where this dump is written)
+           - binary files are still listed, but their bytes are omitted
+           - output opens with a visual directory TREE
       5. git status / add / commit / push origin --all / remote show origin
       6. Pop-Location back to the original directory (always, via finally)
 
@@ -34,6 +38,32 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+# Directory prefixes excluded from BOTH the tree and the file contents.
+# docs/llm is excluded because the dump itself is written there — including it
+# would embed a previous copy of the dump inside itself.
+$ExcludeDirectories = @("docs/llm")
+
+# Optional extra path globs to skip (matched against the forward-slash path).
+# Empty by default, so EVERYTHING in git is exported. Enable to cut noise, e.g.:
+#   "src/AppointMe.Frontend/yarn.lock"
+#   "src/AppointMe.Frontend/src/api/*"      # generated Orval API client
+$ExcludePathGlobs = @()
+
+# Extensions whose bytes are not text. These files are still listed in the tree
+# and still get a content entry, but their raw bytes are omitted. A NUL-byte
+# scan (below) catches anything not listed here. NOTE: svg is text, so it is
+# intentionally absent and will be dumped in full.
+$BinaryExtensions = @(
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff",
+    "pdf", "zip", "gz", "tar", "7z", "rar",
+    "dll", "exe", "pdb", "so", "dylib",
+    "woff", "woff2", "ttf", "otf", "eot",
+    "mp3", "mp4", "mov", "avi", "wav", "ogg",
+    "snk", "p12", "pfx"
+)
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 function Write-Timestamp {
     Write-Host (Get-Date -Format "yyyy-MM-dd-HH-mm-ss") -ForegroundColor DarkGray
@@ -56,27 +86,98 @@ function Invoke-Git {
     }
 }
 
-# File extensions to include (without the leading dot)
-$IncludeExtensions = @(
-    "cs", "json", "xml", "csproj", "slnx", "sln", "config",
-    "cshtml", "razor", "js", "css", "scss", "html",
-    "yml", "yaml", "sql", "props", "targets", "sh",
-    "ps1", "md", "ts", "json"
-)
+function Test-PathExcluded {
+    param([Parameter(Mandatory)][string]$RelativePath)
+    $norm = $RelativePath -replace '\\', '/'
+    foreach ($d in $ExcludeDirectories) {
+        $dd = $d.TrimEnd('/')
+        if ($norm -eq $dd -or $norm -like "$dd/*") { return $true }
+    }
+    foreach ($g in $ExcludePathGlobs) {
+        if ($norm -like $g) { return $true }
+    }
+    return $false
+}
 
-# Exact filenames (no extension match needed)
-$IncludeSpecificFiles = @(
-    "Dockerfile", ".dockerignore", ".editorconfig",
-    ".gitignore", ".gitattributes"
-)
+function Test-FileIsBinary {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Extension = ''
+    )
+    if ($BinaryExtensions -contains $Extension) { return $true }
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $buffer = [byte[]]::new(8192)
+            $read   = $stream.Read($buffer, 0, $buffer.Length)
+            for ($b = 0; $b -lt $read; $b++) {
+                if ($buffer[$b] -eq 0) { return $true }   # NUL byte => binary
+            }
+        }
+        finally { $stream.Dispose() }
+    }
+    catch {
+        return $false
+    }
+    return $false
+}
 
-# Directories to skip even if tracked (e.g. this script's own output)
-$ExcludeDirectories = @("docs")
+# Build a nested ordered-dictionary tree from a flat list of "/"-separated paths.
+function ConvertTo-FileTree {
+    param([string[]]$Paths = @())
+    $root = [ordered]@{}
+    foreach ($path in $Paths) {
+        $parts = @(($path -replace '\\', '/') -split '/' | Where-Object { $_ -ne '' })
+        $node  = $root
+        for ($k = 0; $k -lt $parts.Count; $k++) {
+            $part   = $parts[$k]
+            $isLeaf = ($k -eq $parts.Count - 1)
+            if ($isLeaf) {
+                if (-not $node.Contains($part)) { $node[$part] = $null }   # file
+            }
+            else {
+                if (-not $node.Contains($part) -or
+                    $node[$part] -isnot [System.Collections.Specialized.OrderedDictionary]) {
+                    $node[$part] = [ordered]@{}
+                }
+                $node = $node[$part]
+            }
+        }
+    }
+    return $root
+}
+
+# Render the tree into the StringBuilder using box-drawing connectors.
+# Directories are listed first, then files, each group sorted alphabetically.
+function Write-FileTree {
+    param(
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$Node,
+        [Parameter(Mandatory)][System.Text.StringBuilder]$Builder,
+        [string]$Prefix = ''
+    )
+    $dirNames  = @($Node.Keys | Where-Object { $Node[$_] -is    [System.Collections.Specialized.OrderedDictionary] } | Sort-Object)
+    $fileNames = @($Node.Keys | Where-Object { $Node[$_] -isnot [System.Collections.Specialized.OrderedDictionary] } | Sort-Object)
+    $names     = @($dirNames) + @($fileNames)
+
+    for ($idx = 0; $idx -lt $names.Count; $idx++) {
+        $name   = $names[$idx]
+        $isLast = ($idx -eq $names.Count - 1)
+        $isDir  = $Node[$name] -is [System.Collections.Specialized.OrderedDictionary]
+        $branch = if ($isLast) { '└── ' } else { '├── ' }
+        $label  = if ($isDir)  { "$name/" } else { $name }
+        [void]$Builder.AppendLine("$Prefix$branch$label")
+        if ($isDir) {
+            $childPrefix = $Prefix + $(if ($isLast) { '    ' } else { '│   ' })
+            Write-FileTree -Node $Node[$name] -Builder $Builder -Prefix $childPrefix
+        }
+    }
+}
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 Push-Location $ProjectPath
 try {
     $ResolvedRoot = (Resolve-Path ".").Path
+    $RepoName     = Split-Path $ResolvedRoot -Leaf
 
     # ── Step 0: Sanity check — are we in a git repo? ─────────────────────────
     Write-Step "Verifying git repository at $ResolvedRoot"
@@ -116,29 +217,31 @@ try {
         New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     }
 
-    Write-Host "Querying git for tracked files..." -ForegroundColor Cyan
+    Write-Host "Querying git for files..." -ForegroundColor Cyan
+    # --cached  => tracked files
+    # --others --exclude-standard => untracked files that are NOT gitignored
+    #   (these get committed by 'git add .' below, so we dump them too)
     $gitFiles = git ls-files --cached --others --exclude-standard
     if ($LASTEXITCODE -ne 0) {
         throw "git ls-files failed."
     }
 
-    # Filter to desired extensions / specific filenames, exclude dirs
-    $AllFiles = $gitFiles | ForEach-Object {
-        $rel  = $_
-        $name = Split-Path $rel -Leaf
-        $ext  = ($name -replace '^.*\.', '').ToLower()
+    # Everything git knows about, minus the configured exclusions.
+    $TrackedPaths = $gitFiles |
+        Where-Object { $_ -and -not (Test-PathExcluded $_) } |
+        Sort-Object -Unique
 
-        foreach ($d in $ExcludeDirectories) {
-            if ($rel -like "$d/*" -or $rel -like "$d\*") { return }
-        }
-
-        if ($IncludeExtensions -contains $ext -or $IncludeSpecificFiles -contains $name) {
-            $fullPath = Join-Path $ResolvedRoot $rel
-            if (Test-Path $fullPath) {
-                [PSCustomObject]@{ Relative = $rel; Full = $fullPath }
+    # Resolve to objects with metadata; keep only paths that exist on disk.
+    $AllFiles = @(
+        foreach ($rel in $TrackedPaths) {
+            $full = Join-Path $ResolvedRoot $rel
+            if (Test-Path -LiteralPath $full) {
+                $name = Split-Path $rel -Leaf
+                $ext  = if ($name -like '*.*') { ($name -replace '^.*\.', '').ToLower() } else { '' }
+                [PSCustomObject]@{ Relative = $rel; Full = $full; Extension = $ext }
             }
         }
-    } | Sort-Object Relative
+    )
 
     Write-Host "Found $($AllFiles.Count) files to export" -ForegroundColor Green
 
@@ -146,15 +249,20 @@ try {
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine(@"
 ===============================================================================
-ASP.NET PROJECT EXPORT  (git-tracked files only)
+ASP.NET PROJECT EXPORT  (git-tracked files)
 Generated: $(Get-Date)
 Project Path: $ResolvedRoot
+Excluded:   $($ExcludeDirectories -join ', ')
 ===============================================================================
 
-DIRECTORY STRUCTURE (tracked):
-==============================
+DIRECTORY TREE:
+===============
 "@)
-    foreach ($p in ($gitFiles | Sort-Object)) { [void]$sb.AppendLine($p) }
+
+    [void]$sb.AppendLine("$RepoName/")
+    $tree = ConvertTo-FileTree -Paths $AllFiles.Relative
+    Write-FileTree -Node $tree -Builder $sb
+
     [void]$sb.AppendLine()
     [void]$sb.AppendLine("FILE CONTENTS:")
     [void]$sb.AppendLine("==============")
@@ -174,13 +282,18 @@ DIRECTORY STRUCTURE (tracked):
         [void]$sb.AppendLine($sep)
         [void]$sb.AppendLine()
 
-        try {
-            $content = Get-Content -LiteralPath $f.Full -Raw -ErrorAction Stop
-            if ($content) { [void]$sb.AppendLine($content) }
-            else          { [void]$sb.AppendLine("[EMPTY FILE]") }
+        if (Test-FileIsBinary -Path $f.Full -Extension $f.Extension) {
+            [void]$sb.AppendLine("[BINARY FILE — $([math]::Round($info.Length / 1KB, 2)) KB, contents omitted]")
         }
-        catch {
-            [void]$sb.AppendLine("[ERROR READING FILE: $($_.Exception.Message)]")
+        else {
+            try {
+                $content = Get-Content -LiteralPath $f.Full -Raw -ErrorAction Stop
+                if ($content) { [void]$sb.AppendLine($content) }
+                else          { [void]$sb.AppendLine("[EMPTY FILE]") }
+            }
+            catch {
+                [void]$sb.AppendLine("[ERROR READING FILE: $($_.Exception.Message)]")
+            }
         }
         [void]$sb.AppendLine()
         [void]$sb.AppendLine()
