@@ -1,6 +1,6 @@
 ===============================================================================
 ASP.NET PROJECT EXPORT  (git-tracked files only)
-Generated: 06/11/2026 13:59:17
+Generated: 06/11/2026 14:00:52
 Project Path: D:\DEV\personal\appointme
 ===============================================================================
 
@@ -29885,7 +29885,7 @@ npx license-checker-rseidelsohn --summary
 
 
 ===============================================================================
-EXPORT COMPLETED: 06/11/2026 13:59:18
+EXPORT COMPLETED: 06/11/2026 14:00:53
 Total Files Exported: 577
 Output File: D:\DEV\personal\appointme\docs\llm\dump.txt
 ===============================================================================
