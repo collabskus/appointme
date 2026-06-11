@@ -1,11 +1,11 @@
 global using AppointMe.Organizations.Infrastructure;
 global using AppointMe.Organizations.Settings.Permissions;
 global using AppointMe.Organizations.Tests;
-global using AppointMe.Shared.Tests;
 global using AppointMe.Organizations.Tests.Permissions;
-global using AppointMe.Shared.Authorization.Principals;
-global using AppointMe.Shared.Authorization.Roles;
-global using AppointMe.Shared.Companies;
 global using AppointMe.Shared.Authorization.Permissions;
 global using AppointMe.Shared.Authorization.Permissions.DefaultGrants;
 global using AppointMe.Shared.Authorization.Permissions.OverrideConflicts;
+global using AppointMe.Shared.Authorization.Principals;
+global using AppointMe.Shared.Authorization.Roles;
+global using AppointMe.Shared.Companies;
+global using AppointMe.Shared.Tests;

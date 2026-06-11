@@ -1,6 +1,6 @@
 using AppointMe.Crm.Customers;
-using AppointMe.Shared.Authorization.Roles;
 using AppointMe.Shared.Authorization.Permissions.DefaultGrants;
+using AppointMe.Shared.Authorization.Roles;
 
 namespace AppointMe.Crm.Authorization;
 

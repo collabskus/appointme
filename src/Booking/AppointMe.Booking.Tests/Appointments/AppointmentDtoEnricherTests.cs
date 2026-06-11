@@ -7,19 +7,19 @@ public class AppointmentDtoEnricherTests
         string? providerLastName,
         string? attendeeFirstName,
         string? attendeeLastName) => new()
-    {
-        Id = NewId(),
-        Start = DateTimeOffset.UtcNow,
-        End = DateTimeOffset.UtcNow.AddHours(1),
-        Status = AppointmentStatus.Scheduled,
-        ProviderId = NewId(),
-        ProviderFirstName = providerFirstName,
-        ProviderLastName = providerLastName,
-        AttendeeId = NewId(),
-        AttendeeFirstName = attendeeFirstName,
-        AttendeeLastName = attendeeLastName,
-        ScheduledAt = DateTimeOffset.UtcNow
-    };
+        {
+            Id = NewId(),
+            Start = DateTimeOffset.UtcNow,
+            End = DateTimeOffset.UtcNow.AddHours(1),
+            Status = AppointmentStatus.Scheduled,
+            ProviderId = NewId(),
+            ProviderFirstName = providerFirstName,
+            ProviderLastName = providerLastName,
+            AttendeeId = NewId(),
+            AttendeeFirstName = attendeeFirstName,
+            AttendeeLastName = attendeeLastName,
+            ScheduledAt = DateTimeOffset.UtcNow
+        };
 
     [Fact]
     public void should_enrich_full_name_and_initials_for_both_provider_and_attendee_when_names_are_present()

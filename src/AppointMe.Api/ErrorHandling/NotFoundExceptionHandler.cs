@@ -1,8 +1,8 @@
 namespace AppointMe.Api.ErrorHandling;
 
-using Shared.Domain.Errors;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
+using Shared.Domain.Errors;
 
 internal sealed class NotFoundExceptionHandler(
     IProblemDetailsService problemDetailsService,

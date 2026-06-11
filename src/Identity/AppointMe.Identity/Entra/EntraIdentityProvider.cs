@@ -31,12 +31,12 @@ public sealed class EntraIdentityProvider(
         try
         {
             var invitation = await _graph.Invitations.PostAsync(new Invitation
-                             {
-                                 InvitedUserEmailAddress = email,
-                                 InvitedUserDisplayName = displayName,
-                                 InviteRedirectUrl = redirectUri,
-                                 SendInvitationMessage = true,
-                             }, cancellationToken: cancellationToken) ??
+            {
+                InvitedUserEmailAddress = email,
+                InvitedUserDisplayName = displayName,
+                InviteRedirectUrl = redirectUri,
+                SendInvitationMessage = true,
+            }, cancellationToken: cancellationToken) ??
                              throw new InvalidOperationException("Graph returned a null invitation.");
 
             var userId = invitation.InvitedUser?.Id

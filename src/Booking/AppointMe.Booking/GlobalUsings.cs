@@ -1,12 +1,12 @@
+global using AppointMe.Shared.Authorization.Principals;
+global using AppointMe.Shared.Companies;
+global using AppointMe.Shared.Domain;
+global using AppointMe.Shared.Domain.Common;
+global using AppointMe.Shared.Domain.Errors;
+global using AppointMe.Shared.Endpoints;
 global using Microsoft.AspNetCore.Builder;
 global using Microsoft.AspNetCore.Http;
 global using Microsoft.AspNetCore.Routing;
 global using Microsoft.EntityFrameworkCore;
 global using Wolverine;
-global using AppointMe.Shared.Domain;
 global using static AppointMe.Shared.Domain.Id;
-global using AppointMe.Shared.Domain.Common;
-global using AppointMe.Shared.Domain.Errors;
-global using AppointMe.Shared.Endpoints;
-global using AppointMe.Shared.Companies;
-global using AppointMe.Shared.Authorization.Principals;

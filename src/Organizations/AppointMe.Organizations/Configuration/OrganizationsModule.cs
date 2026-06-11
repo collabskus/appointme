@@ -3,14 +3,14 @@ using AppointMe.Organizations.Contracts.Companies;
 using AppointMe.Organizations.Contracts.Employees;
 using AppointMe.Organizations.Database;
 using AppointMe.Organizations.Employees;
-using AppointMe.Organizations.Infrastructure;
 using AppointMe.Organizations.Employees.Database;
+using AppointMe.Organizations.Infrastructure;
 using AppointMe.Organizations.Settings.Permissions.Infrastructure;
-using AppointMe.Shared.Configuration;
 using AppointMe.Shared.Authorization.Permissions;
+using AppointMe.Shared.Authorization.Permissions.OverrideConflicts;
+using AppointMe.Shared.Configuration;
 using AppointMe.Shared.Database;
 using AppointMe.Shared.Database.Migrations;
-using AppointMe.Shared.Authorization.Permissions.OverrideConflicts;
 using Microsoft.Extensions.DependencyInjection;
 using Wolverine.Attributes;
 

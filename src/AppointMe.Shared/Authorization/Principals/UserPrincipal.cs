@@ -1,6 +1,6 @@
+using AppointMe.Shared.Authorization.Permissions;
 using AppointMe.Shared.Authorization.Roles;
 using AppointMe.Shared.Companies;
-using AppointMe.Shared.Authorization.Permissions;
 
 namespace AppointMe.Shared.Authorization.Principals;
 

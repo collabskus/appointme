@@ -3,8 +3,8 @@ using AppointMe.Shared.Domain;
 using JasperFx.CodeGeneration;
 using JasperFx.CodeGeneration.Model;
 using Wolverine;
-using Wolverine.AzureServiceBus;
 using Wolverine.Attributes;
+using Wolverine.AzureServiceBus;
 using Wolverine.EntityFrameworkCore;
 using Wolverine.SqlServer;
 

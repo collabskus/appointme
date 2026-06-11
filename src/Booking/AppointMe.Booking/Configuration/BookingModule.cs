@@ -6,11 +6,11 @@ using AppointMe.Booking.Database;
 using AppointMe.Booking.Infrastructure;
 using AppointMe.Booking.ServiceProviders.Database;
 using AppointMe.Booking.ServiceProviders.ReconcileServiceProviders;
-using AppointMe.Shared.Configuration;
-using AppointMe.Shared.Jobs;
 using AppointMe.Shared.Authorization.Permissions;
+using AppointMe.Shared.Configuration;
 using AppointMe.Shared.Database;
 using AppointMe.Shared.Database.Migrations;
+using AppointMe.Shared.Jobs;
 using Microsoft.Extensions.DependencyInjection;
 using Wolverine.Attributes;
 
