@@ -1,162 +1,171 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for AI coding assistants (and humans) working in this repository.
 
-## Build and Development Commands
+AppointMe is a personal learning sandbox: a multi-tenant appointment-booking
+SaaS built as a **.NET 10 modular monolith** with a **React 19** front end. It
+exists to practise — and to demonstrate clearly — modern back-end architecture
+patterns. Correctness matters, but so does being a good worked example. When you
+change something, keep it idiomatic and keep the docs honest.
 
-### Running the Full Stack (Recommended)
+For the *why* behind every pattern named below — from first principles, with the
+trade-offs and the things deliberately done "wrong" — read **`docs/ARCHITECTURE.md`**.
+
+---
+
+## Tech stack (authoritative — verify here before claiming versions)
+
+Back end:
+- .NET 10 / C# 14 (`LangVersion` 14; uses extension members, `Guid.CreateVersion7`)
+- EF Core 10 for writes; **Dapper** for read queries
+- **WolverineFx 6** — in-process mediator, message handlers, durable messaging, sagas
+- **Hangfire** — background jobs
+- **Scrutor** — assembly scanning / decoration
+- Asp.Versioning for API versioning; OpenTelemetry for traces/metrics/logs
+
+Front end:
+- React 19 + Vite + TypeScript, Tailwind CSS 4
+- TanStack Query v5 (uses `useSuspenseQuery`), React Hook Form, Zod 4
+- FullCalendar for the calendar UI
+- **orval** generates a typed API client from the API's OpenAPI document
+
+Infrastructure / dev:
+- **SQL Server 2025** (`mcr.microsoft.com/mssql/server:2025-CU1-ubuntu-24.04`)
+- **Keycloak 26** as the identity provider (`quay.io/keycloak/keycloak:26.6`)
+- **Mailpit** as the local mail catcher
+- **.NET Aspire** (`src/AppointMe.Aspire`) orchestrates all of the above for local dev
+
+> Messaging note: locally and by default, Wolverine uses its **SQL-Server-backed
+> durable transport** (`Wolverine:Transport = SqlDurable`) — there is no external
+> broker and no Service Bus emulator in the loop. Azure Service Bus is an opt-in
+> alternative (`Wolverine:Transport = AzureServiceBus`) used only in the
+> Azure-hosted configuration.
+
+---
+
+## Solution layout
+
+A module = a folder of projects under `src/<Module>/`, isolated behind a
+`*.Contracts` project. Modules talk to each other only through contracts and
+messages, never by referencing each other's internals.
+
+- `src/Identity` — users, sign-up, login/logout, Keycloak provisioning
+- `src/Organizations` — companies, members, roles, the **permission engine**
+- `src/Crm` — customers
+- `src/Booking` — services, providers, availability, **appointments** (fully built)
+- `src/AppointMe.Shared` — cross-cutting building blocks (auth primitives,
+  domain base types, EF/Dapper helpers, the startup **migration runner**,
+  configuration options)
+- `src/AppointMe.Api` — the composition root: wires every module, hosts the
+  Wolverine handler-context middleware, serves the SPA, owns demo seeding
+- `src/AppointMe.Frontend` — the React SPA
+- `src/AppointMe.Aspire` — local orchestration host + the Keycloak realm export
+
+---
+
+## Key patterns (what you'll run into)
+
+- **Vertical slices.** Each use case lives in its own folder — endpoint +
+  request/command + handler + its read query — not spread across
+  Controllers/Services/Repositories layers. Add features as new slices.
+- **CQRS, pragmatic.** Writes go through EF Core aggregates; reads are hand-
+  written Dapper SQL returning DTOs. They do not share a model.
+- **Domain events via Wolverine + an EF outbox.** Aggregates raise events;
+  they're persisted in the same transaction as the state change and dispatched
+  after commit.
+- **Handler-context middleware.** A Wolverine `IHandlerPolicy`
+  (`src/AppointMe.Api/Wolverine/HandlerContext/`) inspects each handler's
+  parameters and injects ambient context (current company, identity, principal)
+  only into the handlers that declare it. If you need the caller's company in a
+  handler, just add the parameter.
+- **Permission engine.** Default grants plus per-company overrides, with
+  conflicts resolved by a pluggable voting policy
+  (`IOverrideConflictPolicy`: deny-wins vs grant-wins). See
+  `src/Organizations/.../PermissionResolver.cs`.
+- **Multi-tenancy, fail-closed.** `CompanyResolutionMiddleware` reads the
+  `X-Company-Id` header into an `AsyncLocal` current-company accessor; EF global
+  query filters scope every tenant-owned table to it. No company resolved ⇒ the
+  filter matches **zero** rows (never "all rows"). The front end sets the header
+  in `src/AppointMe.Frontend/src/lib/axios.ts`.
+- **Value objects & strongly-typed IDs.** Domain types (`Email`, `PersonName`,
+  …) are validated via factory methods; IDs are typed structs, not bare `Guid`s.
+  Don't reintroduce primitive obsession.
+- **Hybrid authentication.** A policy scheme picks **JWT Bearer** when an
+  `Authorization` header is present, otherwise **cookie**. Browser login is a
+  standard **OIDC authorization-code flow** (the API issues a `Challenge` that
+  redirects to Keycloak). Two providers are supported behind one abstraction:
+  **Keycloak** (default) and **Microsoft Entra External ID**
+  (`Authentication:Provider = EntraExternalId`).
+
+---
+
+## Common commands
+
+Run the whole thing locally with Aspire (starts SQL Server, Keycloak, Mailpit,
+the API, and the frontend, wired together):
+
 ```bash
-cd src/AppointMe.Aspire && dotnet run
+dotnet run --project src/AppointMe.Aspire
 ```
-This starts all services via .NET Aspire: SQL Server, Azure Service Bus Emulator, Keycloak, Mailpit, API, and Frontend.
 
-### Backend Only
+Or run the backing services with Compose and the app yourself:
+
 ```bash
-dotnet build AppointMe.sln        # Build entire solution
-dotnet run --project src/AppointMe.Api  # Run API
+# one-time: trust the dev cert Keycloak serves, and export it for the container
+dotnet dev-certs https --trust
+dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
+
+docker compose up -d                                  # SQL Server, Keycloak, Mailpit
+dotnet run --project src/AppointMe.Api                # API  → https://localhost:7233
+cd src/AppointMe.Frontend && yarn dev                 # SPA  → https://localhost:5173
 ```
 
-### Frontend Only
+Build & test:
+
 ```bash
-cd src/AppointMe.Frontend
-yarn install
-yarn dev          # Development server (port 5173)
-yarn build        # Production build
-yarn lint         # ESLint
-yarn generate:api # Regenerate API client from OpenAPI spec (see /regenerate-api skill)
+dotnet build AppointMe.sln
+dotnet test                                           # xUnit unit tests
 ```
 
-### Regenerating the frontend API client after backend contract changes
+Code generation:
 
-After any change that alters the OpenAPI surface — new/renamed/removed endpoint, changed `*Request.cs`/`*Response.cs` shape, changed route or HTTP verb, changed auth/permission attributes on an endpoint — invoke the `/regenerate-api` skill **in the same task**. It waits for the API to be reachable on `https://localhost:7233`, runs `yarn generate:api`, and reports the diff on `src/AppointMe.Frontend/src/api/`. The backend must be restarted (Aspire dashboard → restart `appointme-api`, or relaunch `dotnet run` in `src/AppointMe.Aspire`) so orval reads the new contract — a reachable-but-stale backend silently produces a stale client.
-
-Do **not** invoke `/regenerate-api` for backend-only changes that don't affect the contract (internal handlers, domain events, EF config, migrations, tests).
-
-### Testing
 ```bash
-dotnet test                                    # All tests
-dotnet test src/CRM/AppointMe.Crm.Tests        # Single test project
-dotnet test --filter "FullyQualifiedName~TestName"  # Single test
+# Wolverine static codegen (also what the Dockerfile runs at build time)
+ASPNETCORE_ENVIRONMENT=Codegen \
+  dotnet run --project src/AppointMe.Api -- codegen write
+
+# regenerate the typed frontend API client from the API's OpenAPI doc
+cd src/AppointMe.Frontend && yarn generate:api
 ```
 
-## Architecture
+Deploy the full stack in containers (Podman + Cloudflare Tunnel):
 
-This is a **modular monolithic** .NET 10 application following Domain-Driven Design principles.
-
-### Module Structure
-```
-src/
-├── AppointMe.Api/           # ASP.NET Core API entry point
-├── AppointMe.Aspire/        # .NET Aspire orchestrator for local dev
-├── AppointMe.Shared/        # Shared domain abstractions and value objects
-├── Identity/AppointMe.Identity/           # User auth module (Keycloak)
-├── Organizations/AppointMe.Organizations/ # Companies & employees
-├── CRM/AppointMe.Crm/                     # Customer management
-├── Booking/AppointMe.Booking.Contracts/   # Booking contracts (TBD)
-└── AppointMe.Frontend/      # React/Vite/TypeScript frontend
+```bash
+cd deploy
+cp .env.example .env          # then edit .env
+podman-compose --env-file .env up -d --build
 ```
 
-### Key Patterns
+See **`README.md` → "Deploy on a Fedora server"** for the full walkthrough.
 
-**Bounded Contexts**: Each module has its own `DbContext` with separate database schema:
-- `IdentityDbContext` (schema: "identity")
-- `OrganizationsDbContext` (schema: "organizations")
-- `CrmDbContext` (schema: "crm")
+---
 
-**Vertical Slice Architecture**: Inside each module, code is organized by feature/use case rather than by technical layer. Each slice owns everything required to serve that use case and lives in its own folder named after the action (verb-first, CRUD-style for projections).
+## Conventions & gotchas
 
-Example layout:
-```
-Customers/
-├── Customer.cs                       # aggregate root
-├── CustomerId.cs
-├── RegisterCustomer/                 # one slice per use case
-│   ├── RegisterCustomer.cs           # domain factory (extension on aggregate)
-│   ├── RegisterCustomerCommand.cs
-│   ├── RegisterCustomerCommandHandler.cs
-│   ├── RegisterCustomerEndpoint.cs
-│   └── RegisterCustomerRequest.cs
-├── UpdateCustomer/
-├── DeleteCustomer/
-├── GetCustomers/                     # queries are slices too
-└── Database/                         # shared EF config / Dapper queries
-```
-
-Slice rules:
-- Event handlers live in the slice whose domain operation they invoke (e.g. `CustomerRegisteredEventHandler` sits in `CreateAttendee/` because it calls `Attendee.Create`), **not** in a shared `Handlers/` folder.
-- Domain operations on aggregates are expressed as extension methods co-located with the slice (`extension(Aggregate)` for factories, `extension(Aggregate instance)` for mutators) — see `RegisterCustomer.cs`, `UpdateCustomer.cs`, `DeleteCustomer.cs`.
-- Use CRUD-style verbs (`Create`, `Update`, `Delete`) for projection/synchronization slices, and domain-specific verbs (`Register`, `Schedule`, `Cancel`) for slices that own business intent on the source aggregate.
-- Shared infrastructure (EF type configurations, Dapper queries reused across slices, ID types, the aggregate itself) lives alongside the slices in the parent feature folder, not inside any one slice.
-
-**Endpoint Convention**: Implement `IEndpoint` interface. Endpoints are auto-discovered via Scrutor.
-
-**Module Registration**: Each module exposes extension methods:
-```csharp
-.AddIdentityModule()
-.AddCompaniesModule()
-.AddCrmModule()
-```
-
-**Domain Events**: Aggregate roots inherit from `AggregateRoot` and raise `IDomainEvent` events. Wolverine handles async messaging.
-
-**CQRS Pattern**:
-- Writes use Entity Framework Core
-- Reads use Dapper with `IDbConnectionFactory`
-
-**Authentication**: Hybrid auth scheme (JWT Bearer for API calls, Cookies for browser flows) with Keycloak.
-
-**Strongly-Typed IDs**: Each module defines its own ID types wrapping `Guid` (e.g. `CustomerId`, `EmployeeId`, `AttendeeId`, `ServiceProviderId`). Cross-module projections use module-local ID types, not source module IDs.
-
-**Value Objects**: Value objects like `PersonName`, `DateOfBirth`, `Email`, `LongString` live in `AppointMe.Shared/Domain/Common`. They expose two kinds of constructors:
-
-- The **primary constructor** (`new DateOfBirth(value)`, `new Email(value)`, `new PersonName(...)`) is unvalidated. Reserve it for trusted paths only — EF Core materialization via `HasConversion`, Dapper projections, and similar infrastructure code.
-- **Validating factories** live in a companion `…Factory` static class as extension methods on the value object's type. Always construct value objects from untrusted input (HTTP commands, event payloads from other modules, etc.) via these factories — never via the primary constructor.
-  - `Create(...)` — validates and throws `ValidationException` on invalid input.
-  - `CreateOrNull(...)` — returns `null` when the input is null, otherwise delegates to `Create`.
-
-Example (from `RegisterCustomerCommandHandler`):
-```csharp
-var customer = Customer.Register(
-    companyId: companyId,
-    name: PersonName.Create(command.FirstName, command.LastName),
-    dateOfBirth: DateOfBirth.CreateOrNull(command.DateOfBirth, timeProvider),
-    gender: Gender.ParseOrNull(command.Gender),
-    email: Email.CreateOrNull(command.Email),
-    registrationDate: timeProvider.GetUtcNow()
-);
-```
-
-The same rule applies inside event handlers that build projections from cross-module events — the payload is untrusted, so reconstruct value objects via `Create` / `CreateOrNull`, not `new`.
-
-**Permission Auto-Discovery**: Permissions are auto-discovered by assembly scanning. Define permissions as `public static readonly Permission` fields on static classes ending with `Permissions`. Register via `.AddPermissions(assembly)` which also auto-discovers `IDefaultGrantPolicy` implementations via Scrutor.
-
-### Naming Conventions
-
-**Async suffix**: In async-only APIs, asynchronous behavior is implicit; the `Async` suffix is used only to disambiguate from synchronous alternatives.
-
-**Lambda parameters**: Use full, descriptive names — not one- or two-letter abbreviations. Prefer `appointment => appointment.Id` over `a => a.Id`, `customer => customer.Name` over `c => c.Name`. Applies especially to EF `IEntityTypeConfiguration`, LINQ chains, and converter lambdas. Exceptions: single-char names are fine when the lambda is purely structural and the identifier carries no domain meaning (e.g. `x => x` in a trivial selector), but default to the full name.
-
-**Test methods**: Use `snake_case` with a `should_` or descriptive verb prefix that reads as a sentence describing the expected behavior. Test classes are non-sealed. Example:
-```csharp
-public class PermissionResolverTests
-{
-    [Fact]
-    public void should_deny_permission_when_any_role_denies() { ... }
-
-    [Fact]
-    public void should_return_empty_when_no_roles() { ... }
-}
-```
-
-### Tech Stack
-- **Backend**: .NET 10, C# 14, EF Core 10, Wolverine 5.9, Dapper
-- **Frontend**: React 19, TypeScript 5.8, Vite 7, Tailwind CSS 4, TanStack Query
-- **Infrastructure**: SQL Server 2022, Keycloak, Azure Service Bus Emulator
-
-## Local Development Services
-
-When running via Aspire:
-- **SQL Server**: localhost:60740 (sa/Password1)
-- **Keycloak**: http://localhost:8082 (admin/admin)
-- **Mailpit SMTP**: localhost:1026, Web UI: http://localhost:8026
-- **Frontend**: https://localhost:5173
+- **Migrations apply automatically at startup** via a hosted service
+  (`DatabaseMigrationService`). You don't run them by hand; the app migrates each
+  registered `DbContext` on boot. A container deploy needs no separate migration
+  step.
+- **Demo seeding is config-gated, not environment-gated.** Setting
+  `Demo:Enabled = true` seeds demo data even in Production. It is off by default
+  in `appsettings.json`.
+- **Reads use Dapper, writes use EF.** Don't "tidy up" a Dapper read query into
+  the EF model or vice versa — the split is intentional.
+- **Cross-module calls go through `*.Contracts` and messages only.** If you find
+  yourself wanting a project reference into another module's internals, that's
+  the smell the module boundary is meant to catch.
+- **Auth cookie is `Secure`-always.** Login therefore requires HTTPS; there is no
+  supported plain-HTTP login path (the deployment terminates TLS at Cloudflare).
+- **The API serves the SPA.** In a published build the React bundle is copied to
+  `wwwroot` and served with an `index.html` fallback; there is no separate
+  front-end server in production.

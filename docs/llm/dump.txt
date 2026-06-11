@@ -1,6 +1,6 @@
 ===============================================================================
 ASP.NET PROJECT EXPORT  (git-tracked files)
-Generated: 06/11/2026 16:13:05
+Generated: 06/11/2026 17:10:14
 Project Path: D:\DEV\personal\appointme
 Excluded:   docs/llm
 ===============================================================================
@@ -23,6 +23,8 @@ appointme/
 │   └── keycloak/
 │       ├── certs/
 │       │   └── .gitkeep
+│       ├── configure-clients.sh
+│       ├── Containerfile
 │       └── export-dev-cert.sh
 ├── infra/
 │   ├── modules/
@@ -385,6 +387,7 @@ appointme/
 │   │   ├── .prettierrc
 │   │   ├── CLAUDE.md
 │   │   ├── components.json
+│   │   ├── env.example
 │   │   ├── eslint.config.js
 │   │   ├── index.html
 │   │   ├── orval.config.ts
@@ -1040,6 +1043,7 @@ appointme/
 ├── .gitlab-ci.yml
 ├── .gitleaks.toml
 ├── AppointMe.sln
+├── ARCHITECTURE.md
 ├── CLAUDE.md
 ├── compose.yaml
 ├── Directory.Build.props
@@ -2282,261 +2286,937 @@ EndGlobal
 
 
 ================================================================================
+FILE: ARCHITECTURE.md
+SIZE: 28.78 KB
+MODIFIED: 06/11/2026 17:08:14
+================================================================================
+
+# AppointMe — Architecture from first principles
+
+This document explains *why* AppointMe is built the way it is. The patterns here
+— modular monolith, vertical slices, CQRS, domain events, a permission engine,
+fail-closed multi-tenancy — are not decoration. Each one solves a specific
+problem, and each one has a cost. The goal of this doc is that you finish it able
+to defend every choice **and** name the situation where you'd choose differently.
+
+A running theme: **architecture is the art of deciding what's hard to change
+later, and making *that* easy to change.** Almost every pattern below is buying
+flexibility in one dimension by spending complexity in another. Good engineering
+is knowing which dimension you actually need flexible.
+
+The last section, ["What I'd do differently"](#what-id-do-differently-and-the-traps-this-repo-deliberately-shows),
+is the most important. The patterns are the "what to do"; that section is the
+"what not to do, and why."
+
+---
+
+## The system at a glance
+
+One deployable process (the monolith) contains four business **modules** —
+Identity, Organizations, CRM, Booking — plus a Shared kit and an API host. A
+React SPA talks to it over a versioned HTTP API. Writes go through EF Core
+aggregates; reads are hand-written Dapper queries. Modules never call into each
+other's internals — they communicate through published **contracts** and
+in-process **messages** carried by Wolverine. Every tenant-owned row is scoped to
+a company that's resolved per request and enforced in the database layer.
+
+That's the whole shape. The rest is detail and justification.
+
+---
+
+## Modular monolith
+
+### The problem it solves
+
+Two failure modes sit at opposite ends of a spectrum.
+
+At one end, the **big ball of mud**: a single codebase where everything can reach
+everything. It's fast to start and miserable to grow — a change to billing
+quietly breaks scheduling because some helper reached across the whole app. There
+are no real seams, so there's no safe place to cut.
+
+At the other end, **microservices from day one**: every bounded context is its
+own deployable service with its own database, talking over the network. This
+gives you hard isolation and independent scaling — at the price of distributed
+transactions, network failure handling, versioned wire contracts, eventual
+consistency everywhere, and an operational burden (service discovery, tracing,
+deployment orchestration) that can swallow a small team whole. You pay all of
+that on day one, whether or not your scale or your org structure needs it.
+
+A **modular monolith** takes the middle: **one process and one database, but
+hard internal module boundaries enforced in code.** You get the isolation and the
+clear seams of services without the network and the distributed-systems tax.
+
+### How it's done here
+
+- A module is a folder of projects under `src/<Module>/` (Identity,
+  Organizations, Crm, Booking).
+- Each module publishes a **`*.Contracts`** project: the DTOs, integration events,
+  and interfaces that are its *public* surface. Everything else in the module is
+  internal.
+- Modules reference **only each other's Contracts**, never each other's internals.
+  When Booking needs to react to "a company was registered," it handles the
+  `CompanyRegistered` event from `Organizations.Contracts` — it does not reference
+  the Organizations data model.
+- The API project (`src/AppointMe.Api`) is the **composition root**: the one place
+  that knows about every module and wires them together at startup.
+
+### Why this specific discipline matters
+
+The boundary is only real if it's **enforced**, not merely intended. A comment
+saying "please don't call into this" is not a boundary. The `*.Contracts`
+indirection makes the boundary a *compile error* to cross: there's simply no
+reference that lets module A see module B's internals. That's the entire value —
+the architecture defends itself, so it survives contact with a deadline.
+
+The payoff you're banking for later: because the seams are genuine, **any module
+could be extracted into its own service** if one day it actually needs separate
+scaling or a separate team. You haven't paid the distributed-systems cost, but
+you've kept the option to. That's the trade in one sentence — *isolation now,
+distribution later if and only if you need it.*
+
+### When you'd choose differently
+
+- **A genuinely tiny app** (a CRUD form over one table) doesn't need modules; the
+  ceremony would cost more than the mud would. Boundaries earn their keep once
+  there are multiple bounded contexts that change for different reasons.
+- **Truly independent scaling or failure isolation** — one component must scale to
+  10× the rest, or must stay up when the rest is down — is a real reason to reach
+  for separate services. Notice that's a *runtime* requirement, not a tidiness
+  preference. "It would feel cleaner as microservices" is not a requirement.
+
+---
+
+## Vertical slice architecture
+
+### The problem it solves
+
+The default way most of us learned to structure a back end is by **technical
+layer**: a Controllers folder, a Services folder, a Repositories folder, a
+Models folder. It looks tidy in a diagram. But think about how you actually
+*work*: you implement a feature — "schedule an appointment." With layers, that one
+feature is smeared across four folders, and to understand it you open four files
+that each also contain bits of twenty *other* features. The thing that changes
+together (a feature) is scattered, and the things that change for different
+reasons (unrelated features) are jammed together in the same `AppointmentService`.
+That's backwards. It maximises the blast radius of every change.
+
+### The idea
+
+Organise by **feature**, not by layer. Each use case gets its own folder
+containing everything that use case needs: the endpoint, the request/command, the
+handler that does the work, and the read query that serves it. The unit of code
+matches the unit of change.
+
+A slice in this repo typically looks like:
+
+```
+Booking/.../Appointments/ScheduleAppointment/
+    ScheduleAppointmentEndpoint.cs      // HTTP shape: route, binding, status codes
+    ScheduleAppointmentRequest.cs       // the API contract
+    ScheduleAppointmentCommand.cs       // the internal command
+    ScheduleAppointmentCommandHandler.cs// the actual behaviour
+```
+
+To understand or change "schedule an appointment," you open **one folder**. To
+add a feature, you add a **new folder** — you rarely touch existing ones, so you
+rarely risk breaking them.
+
+### Why it's worth it
+
+- **Low coupling between features, high cohesion within one.** Exactly the
+  property layered code inverts.
+- **Changes are local.** New feature ⇒ new slice. The diff is contained and the
+  review is easy.
+- **The code reads like the product.** The folder tree is a list of things the
+  system does, which is a far better map than a list of architectural nouns.
+
+### The honest costs
+
+- **Some duplication is expected and *fine*.** Two slices may each have a similar
+  bit of validation or mapping. Vertical slicing deliberately tolerates a little
+  duplication to avoid premature shared abstractions — because a shared helper is a
+  coupling point, and coupling between features is the thing you're trying to
+  avoid. The discipline is to extract to Shared **only** when the duplication is
+  genuinely the same concept, not merely similar-looking code today. (This is the
+  practical reading of "prefer duplication over the wrong abstraction.")
+- **Cross-cutting concerns need a home.** Auth, logging, validation, transactions
+  can't live in every slice. They live in middleware / Wolverine policies (see the
+  handler-context section). Slices handle *features*; the pipeline handles
+  *everything-features*.
+
+### When you'd choose differently
+
+If a codebase is small and overwhelmingly uniform CRUD, classic layering is
+perfectly fine and more familiar to newcomers. Vertical slices shine when
+features are numerous and behaviourally distinct — which is exactly the case for
+a booking domain with scheduling rules, availability, permissions, and tenancy.
+
+---
+
+## CQRS, the pragmatic kind
+
+### What it is (and what it is *not*)
+
+CQRS — Command Query Responsibility Segregation — means **the model you use to
+change state and the model you use to read state don't have to be the same
+model.** That's the whole idea. It does *not* require event sourcing, separate
+databases, separate services, or message buses. Those are options some teams bolt
+on; they are not CQRS.
+
+### Why split reads from writes
+
+Writes and reads want opposite things:
+
+- **Writes** must protect invariants. "You can't book an appointment in the past."
+  "A company must have at least one owner." Enforcing rules like these needs a rich
+  object — an **aggregate** — that owns its data and refuses to enter an invalid
+  state. EF Core, with change tracking and a domain model, is built for this.
+- **Reads** just need to shovel exactly the right shape of data to a screen, fast.
+  A calendar view wants a flat, joined, paged projection. Loading a graph of
+  tracked aggregates to render a list is wasteful and often awkward. Hand-written
+  SQL that returns precisely the DTO the screen needs is simpler and faster.
+
+Forcing both through one model means one side always compromises: either your
+reads drag a heavy domain model around, or your writes get anaemic to keep reads
+convenient.
+
+### How it's done here
+
+- **Write side:** EF Core 10 aggregates. Commands flow through Wolverine handlers,
+  load an aggregate, call a method on it that enforces the rules, and save.
+- **Read side:** Dapper. Hand-written SQL maps straight to query DTOs, with
+  helpers for pagination. No EF model involved.
+
+This is "CQRS-lite": same database, two models over it. You get the clarity of
+purpose-built read and write models without the consistency headaches of two data
+stores.
+
+### The cost, and when to go further
+
+The cost is **two ways to touch data** — contributors must know writes go through
+EF aggregates and reads go through Dapper, and not "tidy" one into the other. That
+split is intentional; don't undo it.
+
+You'd go *further* (separate read store, projections kept up to date by events)
+only when reads and writes have genuinely different **scaling** needs, or read
+shapes are so divergent that maintaining them against the write DB hurts. That's a
+real technique with a real price (eventual consistency between the stores); this
+app doesn't need it, and reaching for it here would be cargo-culting.
+
+---
+
+## Domain events, the outbox, and the handler-context middleware
+
+### Why domain events at all
+
+When something meaningful happens in one part of the domain, other parts often
+need to react. A company is registered ⇒ seed its demo data, set up its defaults.
+You could hard-wire those reactions into the registration handler, but then
+registration *knows about* demo seeding and defaults and everything else, and grows
+a new dependency every time a new reaction is added. That's coupling creeping back
+in through the back door.
+
+**Domain events invert the dependency.** The aggregate announces a fact —
+"`CompanyRegistered`" — without knowing or caring who listens. Reactions subscribe.
+Registration stays about registration; new reactions are new handlers, touching no
+existing code. (This is the same decoupling instinct as vertical slices, applied to
+*behaviour over time* instead of *code on disk*.)
+
+### The reliability problem, and the outbox
+
+Here's the subtle trap. You change state in the database **and** you want to fire
+an event. If you commit the DB change and *then* publish the event, a crash in
+between loses the event — the state changed but nobody reacted. If you publish
+first and the DB commit fails, you've announced something that didn't happen. This
+is the **dual-write problem**, and it's a classic source of "impossible" production
+bugs.
+
+The fix is the **transactional outbox**: the event is written to an outbox table
+**in the same database transaction** as the state change. Either both land or
+neither does. A separate dispatcher then reads the outbox and delivers the events,
+retrying until they're acknowledged. Wolverine implements this on top of SQL
+Server here (its durable transport). The result is **at-least-once** delivery with
+no lost or phantom events — which is why handlers should be **idempotent** (safe to
+run twice), since "at least once" can mean "occasionally twice."
+
+### The standout: handler-context middleware
+
+Most handlers need ambient facts about the current call: *which company* is this
+for, *who* is the caller, what's their principal. The naïve approaches are both
+bad:
+
+- Pass them as parameters through every layer → noise everywhere, and easy to
+  forget.
+- Reach into a global/static "current context" inside each handler → hidden
+  dependency, untestable, and it couples every handler to the ambient plumbing.
+
+This codebase does something cleaner. A Wolverine **`IHandlerPolicy`**
+(in `src/AppointMe.Api/Wolverine/HandlerContext/`) inspects each message
+handler's **parameters** at startup and, for handlers that *declare* they want the
+current company / identity / principal, weaves the code to supply it into the
+generated handler pipeline (`chain.Uses<…>()`). A handler that needs the caller's
+company simply **adds that parameter to its signature** — and the middleware fills
+it in. A handler that doesn't, doesn't pay for it.
+
+Why this is good design, from first principles:
+
+- **Dependencies are explicit and local.** A handler's needs are visible in its
+  own signature — the best possible documentation — instead of hidden in a base
+  class or a static accessor.
+- **Pay-for-what-you-use.** The context is injected only where it's asked for; no
+  blanket coupling of every handler to ambient state.
+- **Testable.** Test a handler by calling it with the context you want. There's no
+  global to stub, no `HttpContext` to fake.
+
+It's the dependency-injection principle ("ask for what you need; don't reach for
+it") applied to per-request ambient data, implemented through the framework's
+codegen instead of by hand.
+
+---
+
+## The permission engine
+
+### Why not just roles
+
+Role checks ("is this user an Admin?") get you surprisingly far and then fall over.
+Real authorization is **per-tenant and per-resource**: company A may let receptionists
+cancel appointments while company B reserves that for managers; the platform ships
+sensible **defaults** but each company must be able to **override** them. A flat role
+enum can't express "the default for this permission is *grant*, but this company has
+overridden it to *deny* for this role." You need data, not an enum.
+
+### The model here
+
+Authorization resolves through layers (`src/Organizations/.../PermissionResolver.cs`
+and `src/AppointMe.Shared/Authorization/Permissions/`):
+
+1. **Default grants** — the platform's baseline for each permission.
+2. **Per-company overrides** — a company can grant or deny on top of the defaults.
+3. **Conflict resolution by voting.** When sources disagree, a pluggable
+   **`IOverrideConflictPolicy`** decides the winner:
+   - **deny-wins** (`DenyWinsPolicy`): *every* vote must grant, or it's denied — the
+     conservative, secure default.
+   - **grant-wins** (`GrantWinsPolicy`): *any* grant is enough.
+
+### The first-principles wins
+
+- **Open for extension, closed for modification.** Conflict resolution is a
+  strategy behind an interface. Need a new policy ("two managers must both approve")?
+  Add a class; don't edit the resolver. New behaviour without touching tested code is
+  the whole point of the Open/Closed Principle.
+- **Secure default.** Deny-wins means a *missing* or *ambiguous* permission denies
+  rather than grants. Security decisions should fail toward "no." (Same instinct as
+  the tenancy filter below — when in doubt, show/allow nothing.)
+- **Policy is data, not code.** Companies customise via override records, not code
+  changes or redeploys — exactly what a multi-tenant product needs.
+
+### The cost
+
+It's more moving parts than `[Authorize(Roles="Admin")]`, and resolving a permission
+is a small computation rather than a constant. For a multi-tenant SaaS that's the
+right trade; for a single-tenant internal tool it would be over-built. Match the
+mechanism to whether tenants actually need to differ.
+
+---
+
+## Multi-tenancy, fail-closed
+
+### The stakes
+
+In a multi-tenant system, **the worst bug is one tenant seeing another tenant's
+data.** Not a crash — a crash is loud and you fix it. A silent cross-tenant leak is
+quiet, catastrophic, and erodes the one thing a SaaS sells: trust. So the design
+principle is bluntly defensive: **make leaking data require a deliberate mistake,
+and make the failure mode "see nothing," never "see everything."**
+
+### The mechanism, layer by layer
+
+1. **Resolve the tenant once, at the edge.** `CompanyResolutionMiddleware` reads the
+   `X-Company-Id` header and puts it into a current-company accessor backed by
+   `AsyncLocal`. `AsyncLocal` is the right primitive: it flows with the logical async
+   call (so it's available deep in a handler) without being a process-global shared
+   across requests. The front end sends the header from
+   `src/AppointMe.Frontend/src/lib/axios.ts`.
+2. **Enforce it in the database layer.** EF Core **global query filters** (the named
+   filters in EF 10) attach `WHERE CompanyId = @current` to *every* query against a
+   tenant-owned entity, automatically. You can't forget the `WHERE` clause on a
+   read, because you never write it.
+3. **Fail closed.** This is the crucial bit. If no company was resolved, the filter
+   compares against `null`, so `CompanyId == null` matches **zero** rows. The absence
+   of a tenant yields **nothing**, never **everything**. A bug that drops the tenant
+   shows an empty screen — annoying, safe, obvious — instead of leaking the whole
+   table.
+
+### Why defense in depth, not one check
+
+A single `if` at the controller is one forgotten line away from a breach. Putting
+enforcement at the **data layer** means it holds for *every* query by default —
+including ones a future contributor writes without thinking about tenancy. Combined
+with resolving the tenant at the **edge**, you get two independent layers that both
+have to fail in the same direction to leak data. Defense in depth is exactly this:
+no single mistake is sufficient to cause the catastrophic outcome.
+
+### The cost / the watch-outs
+
+- Background jobs and message handlers run **outside** an HTTP request, so there's no
+  header to read — ambient tenant context has to be **explicitly carried** on the
+  message/job. (This is part of what the handler-context middleware is for.) Forgetting
+  this is the classic way ambient-context tenancy bites you; the discipline is to make
+  the company part of the message, not assume it'll be "around."
+- A genuinely cross-tenant admin/reporting query has to *intentionally* bypass the
+  filter. That bypass should be rare, obvious, and reviewed — its rarity is a feature.
+
+---
+
+## Value objects & strongly-typed IDs
+
+### Primitive obsession, the disease
+
+Represent an email as `string`, a money amount as `decimal`, a customer id as
+`Guid`, and the compiler can't help you. Nothing stops you passing a name where an
+email goes, swapping a `CustomerId` and a `CompanyId` (both `Guid` — the type
+checker sees no difference), or constructing an "email" that isn't one. The rules
+about what makes a value *valid* end up copy-pasted across every place that
+accepts the primitive, and drift.
+
+### The fix here
+
+- **Value objects** (`Email`, `PersonName`, …) are small types created through
+  **validated factory methods** (`Email.Create(...)`, `PersonName.FromFullName(...)`).
+  Validation lives in **one place**, at the boundary where the value comes into
+  existence. Once you hold an `Email`, it is — by construction — a valid email;
+  nothing downstream needs to re-check.
+- **Strongly-typed IDs** are distinct types, not bare `Guid`s. `CustomerId` and
+  `CompanyId` are different types, so passing one where the other is expected is a
+  **compile error**, not a runtime mystery.
+- IDs are generated with `Guid.CreateVersion7()` — time-ordered UUIDs, which (unlike
+  random v4) cluster by creation time and so behave far better as database keys
+  (less index fragmentation, better insert locality).
+
+### Why it pays off
+
+- **Invalid states become unrepresentable.** The cheapest bug is the one the
+  compiler won't let you write. This is the practical face of "make illegal states
+  unrepresentable."
+- **Validation can't drift**, because it isn't duplicated — it's at the single point
+  of construction.
+- **The code documents itself.** A method taking `(CustomerId, Email)` tells you far
+  more than one taking `(Guid, string)`.
+
+### The cost
+
+A little more typing and a little mapping at the edges (to/from the database and the
+wire). It's a small, front-loaded cost that buys correctness for the life of the
+codebase — a good trade for any domain with more than a couple of entities. For a
+throwaway script, skip it.
+
+---
+
+## Authentication: one hybrid scheme, a real OIDC flow
+
+### Two callers, two mechanisms
+
+The same API serves a **browser** (the SPA) and could serve **API clients**. These
+want different auth:
+
+- A browser is happiest with an **HttpOnly, Secure cookie** — it's sent
+  automatically and, being HttpOnly, is out of reach of XSS-stealing JavaScript.
+- A programmatic client sends a **bearer token** in the `Authorization` header.
+
+This app uses a **policy scheme** (`src/AppointMe.Api/Authentication/`) that picks
+per request: if there's a bearer token header, authenticate as **JWT Bearer**;
+otherwise, **cookie**. One pipeline, both audiences, no compromise.
+
+### Login is a redirect, on purpose
+
+Login isn't a username/password POST to the API. The login endpoint issues an OIDC
+**`Challenge`**, which redirects the browser to the identity provider (Keycloak),
+where the user authenticates; Keycloak redirects back to the API's
+`/signin-oidc` callback with an authorization **code**; the API exchanges the code
+for tokens server-side and establishes the cookie session. This is the OAuth 2.0 /
+OpenID Connect **authorization-code flow**.
+
+Why bother, instead of just taking the password yourself? Because the
+authorization-code flow means **your application never sees the user's password.**
+The IdP owns credentials, MFA, social/enterprise login, lockout, password policy —
+all of it. Your app only ever receives short-lived tokens. That's more secure, and
+it's *less* code for you to own and get wrong. The deprecated alternative
+(Resource Owner Password Credentials, a.k.a. direct grant) hands the password to
+your app and throws all of that away — see the next section.
+
+### Pluggable providers
+
+The provider sits behind an abstraction: **Keycloak** is the default; **Microsoft
+Entra External ID** is supported by configuration (`Authentication:Provider`). The
+flow and the rest of the app don't change when you swap the IdP — only configuration
+does. That's the Dependency Inversion Principle paying rent: the app depends on "an
+OIDC provider," not on Keycloak specifically.
+
+### The consequence to remember
+
+The auth cookie is **`Secure`-always**, so the browser only sends it over HTTPS.
+That's correct — but it means **there is no working plain-HTTP login**. Logging in
+requires TLS, which is why the deployment terminates HTTPS at Cloudflare. Don't
+"fix" a local HTTP login problem by weakening the cookie; fix it by putting TLS in
+front. (This is also half the reason the random-`trycloudflare.com` URL can't carry
+login — see the README.)
+
+---
+
+## Testing: what's here, and the honest gap
+
+What exists is a solid base of **unit tests** (xUnit) over the pieces where logic
+concentrates — value-object validation, the permission resolver's voting, domain
+rules on aggregates. These are fast, run anywhere, and pin down the trickiest bits.
+Good.
+
+What's **missing** is **integration tests**: nothing exercises a real request
+through the actual pipeline — middleware, auth, Wolverine, EF against a real
+database. The tools for this are standard (`WebApplicationFactory` to host the app
+in-memory; **Testcontainers** to spin up real SQL Server and Keycloak in Docker for
+the duration of a test run), but they aren't wired up here.
+
+Why this matters, from first principles: **the bugs in a system like this live in
+the wiring**, not in the leaf logic the unit tests cover. Does the tenant filter
+actually fail closed end-to-end? Does the outbox really deliver after a commit? Does
+a permission denial actually produce a 403 through the real middleware stack? Unit
+tests can't answer those — they mock exactly the seams where these bugs hide.
+A handful of integration tests over the critical paths (auth, tenancy isolation,
+scheduling, the outbox) would catch a class of failure the current suite cannot.
+This is the single highest-value addition the test strategy could make.
+
+---
+
+## What I'd do differently — and the traps this repo deliberately shows
+
+The patterns above are the "what to do." This section is the "what to watch," and
+it's the part worth re-reading. A learning sandbox earns its keep partly by showing
+where the seams strain.
+
+1. **An aggregate base type implemented as a `record` with a public mutable events
+   collection.** C# `record`s give *value equality* — two records are "equal" if
+   their fields match. An aggregate has **identity**: two customers with the same
+   data are still two different customers. Worse, a public mutable `Events` list
+   participating in that generated equality means equality depends on
+   not-yet-dispatched events, by reference. Entities should compare by **id**, not by
+   value. Prefer a class with identity-based equality (or at minimum keep the events
+   out of equality). This is a small footgun today that becomes a real one the moment
+   anything puts aggregates in a set or compares them.
+
+2. **No overlap / double-booking check when scheduling.** The scheduling command
+   doesn't verify the new appointment doesn't collide with an existing one for the
+   same provider. For a *booking* product, "two people booked the same slot" is close
+   to the worst domain bug there is. The fix is both an in-domain invariant (the
+   aggregate refuses overlaps) **and** a database guard (a constraint / careful
+   concurrency handling), because under concurrency two requests can each pass an
+   in-memory check and both commit. This is the textbook example of why some
+   invariants *must* be enforced at the database, not just in code.
+
+3. **The CI pipeline is shaped for one specific deployment.** The GitHub Actions
+   workflow's publish-image and deploy-to-Azure jobs are gated on `main` and assume
+   Azure secrets/federated credentials exist. On a fork without them, `main` goes red
+   for reasons that have nothing to do with the code. Build-and-test (which everyone
+   needs) should be separated from publish-and-deploy (which only the canonical repo
+   needs), so a contributor's green build doesn't depend on infrastructure they can't
+   have. Pipelines are part of the architecture; portability is a feature.
+
+4. **Request and Command are often near-duplicates.** Many slices have a
+   `FooRequest` (the API/wire shape) and a `FooCommand` (the internal shape) that look
+   almost identical, plus a mapping between them. It feels like pointless ceremony —
+   right up until the day the public API must stay stable while the internal command
+   changes, or one external request fans out into several commands. The separation is
+   *cheap insurance* on the API↔domain boundary. Reasonable people merge them in small
+   apps; just merge them knowingly, understanding what coupling you're accepting.
+
+5. **The "just take the password" temptation (don't).** Because login is a browser
+   redirect, it can't ride a random ephemeral hostname (the README explains why). The
+   tempting shortcut is to switch to OAuth's **Resource Owner Password Credentials** /
+   direct-grant flow so the SPA posts username+password to the API and the browser
+   never visits Keycloak. Resist it. ROPC is **deprecated in OAuth 2.1** for good
+   reasons: your app handles the user's IdP password (the thing the whole flow exists
+   to avoid), and you lose SSO, MFA, social/enterprise login, and centralized policy.
+   It would "work" and it would be a step backwards. The right answer to the hostname
+   problem is a **stable hostname**, not a weaker protocol. This is the cleanest
+   example in the whole project of a shortcut that solves the immediate problem by
+   creating a worse one.
+
+6. **Ambient context outside a request.** The tenant and identity are resolved from
+   the HTTP request. Background jobs and message handlers have no request, so that
+   context must be **explicitly carried** on the job/message. This is correct as
+   designed — but it's a sharp edge: add a background path that *assumes* ambient
+   context will "be there" and you'll get either a crash or, worse with tenancy, the
+   wrong scope. The rule: outside a request, pass the context in; never reach for it.
+
+If you internalise one thing from this section: **every pattern is a trade, the
+trades are context-dependent, and the senior move is naming the cost out loud.** The
+code above mostly makes good trades. Knowing *why* they're good — and exactly when
+they'd flip — is the actual skill.
+
+
+
+================================================================================
 FILE: CLAUDE.md
-SIZE: 8.79 KB
-MODIFIED: 06/11/2026 13:31:28
+SIZE: 7.67 KB
+MODIFIED: 06/11/2026 17:05:22
 ================================================================================
 
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for AI coding assistants (and humans) working in this repository.
 
-## Build and Development Commands
+AppointMe is a personal learning sandbox: a multi-tenant appointment-booking
+SaaS built as a **.NET 10 modular monolith** with a **React 19** front end. It
+exists to practise — and to demonstrate clearly — modern back-end architecture
+patterns. Correctness matters, but so does being a good worked example. When you
+change something, keep it idiomatic and keep the docs honest.
 
-### Running the Full Stack (Recommended)
+For the *why* behind every pattern named below — from first principles, with the
+trade-offs and the things deliberately done "wrong" — read **`docs/ARCHITECTURE.md`**.
+
+---
+
+## Tech stack (authoritative — verify here before claiming versions)
+
+Back end:
+- .NET 10 / C# 14 (`LangVersion` 14; uses extension members, `Guid.CreateVersion7`)
+- EF Core 10 for writes; **Dapper** for read queries
+- **WolverineFx 6** — in-process mediator, message handlers, durable messaging, sagas
+- **Hangfire** — background jobs
+- **Scrutor** — assembly scanning / decoration
+- Asp.Versioning for API versioning; OpenTelemetry for traces/metrics/logs
+
+Front end:
+- React 19 + Vite + TypeScript, Tailwind CSS 4
+- TanStack Query v5 (uses `useSuspenseQuery`), React Hook Form, Zod 4
+- FullCalendar for the calendar UI
+- **orval** generates a typed API client from the API's OpenAPI document
+
+Infrastructure / dev:
+- **SQL Server 2025** (`mcr.microsoft.com/mssql/server:2025-CU1-ubuntu-24.04`)
+- **Keycloak 26** as the identity provider (`quay.io/keycloak/keycloak:26.6`)
+- **Mailpit** as the local mail catcher
+- **.NET Aspire** (`src/AppointMe.Aspire`) orchestrates all of the above for local dev
+
+> Messaging note: locally and by default, Wolverine uses its **SQL-Server-backed
+> durable transport** (`Wolverine:Transport = SqlDurable`) — there is no external
+> broker and no Service Bus emulator in the loop. Azure Service Bus is an opt-in
+> alternative (`Wolverine:Transport = AzureServiceBus`) used only in the
+> Azure-hosted configuration.
+
+---
+
+## Solution layout
+
+A module = a folder of projects under `src/<Module>/`, isolated behind a
+`*.Contracts` project. Modules talk to each other only through contracts and
+messages, never by referencing each other's internals.
+
+- `src/Identity` — users, sign-up, login/logout, Keycloak provisioning
+- `src/Organizations` — companies, members, roles, the **permission engine**
+- `src/Crm` — customers
+- `src/Booking` — services, providers, availability, **appointments** (fully built)
+- `src/AppointMe.Shared` — cross-cutting building blocks (auth primitives,
+  domain base types, EF/Dapper helpers, the startup **migration runner**,
+  configuration options)
+- `src/AppointMe.Api` — the composition root: wires every module, hosts the
+  Wolverine handler-context middleware, serves the SPA, owns demo seeding
+- `src/AppointMe.Frontend` — the React SPA
+- `src/AppointMe.Aspire` — local orchestration host + the Keycloak realm export
+
+---
+
+## Key patterns (what you'll run into)
+
+- **Vertical slices.** Each use case lives in its own folder — endpoint +
+  request/command + handler + its read query — not spread across
+  Controllers/Services/Repositories layers. Add features as new slices.
+- **CQRS, pragmatic.** Writes go through EF Core aggregates; reads are hand-
+  written Dapper SQL returning DTOs. They do not share a model.
+- **Domain events via Wolverine + an EF outbox.** Aggregates raise events;
+  they're persisted in the same transaction as the state change and dispatched
+  after commit.
+- **Handler-context middleware.** A Wolverine `IHandlerPolicy`
+  (`src/AppointMe.Api/Wolverine/HandlerContext/`) inspects each handler's
+  parameters and injects ambient context (current company, identity, principal)
+  only into the handlers that declare it. If you need the caller's company in a
+  handler, just add the parameter.
+- **Permission engine.** Default grants plus per-company overrides, with
+  conflicts resolved by a pluggable voting policy
+  (`IOverrideConflictPolicy`: deny-wins vs grant-wins). See
+  `src/Organizations/.../PermissionResolver.cs`.
+- **Multi-tenancy, fail-closed.** `CompanyResolutionMiddleware` reads the
+  `X-Company-Id` header into an `AsyncLocal` current-company accessor; EF global
+  query filters scope every tenant-owned table to it. No company resolved ⇒ the
+  filter matches **zero** rows (never "all rows"). The front end sets the header
+  in `src/AppointMe.Frontend/src/lib/axios.ts`.
+- **Value objects & strongly-typed IDs.** Domain types (`Email`, `PersonName`,
+  …) are validated via factory methods; IDs are typed structs, not bare `Guid`s.
+  Don't reintroduce primitive obsession.
+- **Hybrid authentication.** A policy scheme picks **JWT Bearer** when an
+  `Authorization` header is present, otherwise **cookie**. Browser login is a
+  standard **OIDC authorization-code flow** (the API issues a `Challenge` that
+  redirects to Keycloak). Two providers are supported behind one abstraction:
+  **Keycloak** (default) and **Microsoft Entra External ID**
+  (`Authentication:Provider = EntraExternalId`).
+
+---
+
+## Common commands
+
+Run the whole thing locally with Aspire (starts SQL Server, Keycloak, Mailpit,
+the API, and the frontend, wired together):
+
 ```bash
-cd src/AppointMe.Aspire && dotnet run
+dotnet run --project src/AppointMe.Aspire
 ```
-This starts all services via .NET Aspire: SQL Server, Azure Service Bus Emulator, Keycloak, Mailpit, API, and Frontend.
 
-### Backend Only
+Or run the backing services with Compose and the app yourself:
+
 ```bash
-dotnet build AppointMe.sln        # Build entire solution
-dotnet run --project src/AppointMe.Api  # Run API
+# one-time: trust the dev cert Keycloak serves, and export it for the container
+dotnet dev-certs https --trust
+dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
+
+docker compose up -d                                  # SQL Server, Keycloak, Mailpit
+dotnet run --project src/AppointMe.Api                # API  → https://localhost:7233
+cd src/AppointMe.Frontend && yarn dev                 # SPA  → https://localhost:5173
 ```
 
-### Frontend Only
+Build & test:
+
 ```bash
-cd src/AppointMe.Frontend
-yarn install
-yarn dev          # Development server (port 5173)
-yarn build        # Production build
-yarn lint         # ESLint
-yarn generate:api # Regenerate API client from OpenAPI spec (see /regenerate-api skill)
+dotnet build AppointMe.sln
+dotnet test                                           # xUnit unit tests
 ```
 
-### Regenerating the frontend API client after backend contract changes
+Code generation:
 
-After any change that alters the OpenAPI surface — new/renamed/removed endpoint, changed `*Request.cs`/`*Response.cs` shape, changed route or HTTP verb, changed auth/permission attributes on an endpoint — invoke the `/regenerate-api` skill **in the same task**. It waits for the API to be reachable on `https://localhost:7233`, runs `yarn generate:api`, and reports the diff on `src/AppointMe.Frontend/src/api/`. The backend must be restarted (Aspire dashboard → restart `appointme-api`, or relaunch `dotnet run` in `src/AppointMe.Aspire`) so orval reads the new contract — a reachable-but-stale backend silently produces a stale client.
-
-Do **not** invoke `/regenerate-api` for backend-only changes that don't affect the contract (internal handlers, domain events, EF config, migrations, tests).
-
-### Testing
 ```bash
-dotnet test                                    # All tests
-dotnet test src/CRM/AppointMe.Crm.Tests        # Single test project
-dotnet test --filter "FullyQualifiedName~TestName"  # Single test
+# Wolverine static codegen (also what the Dockerfile runs at build time)
+ASPNETCORE_ENVIRONMENT=Codegen \
+  dotnet run --project src/AppointMe.Api -- codegen write
+
+# regenerate the typed frontend API client from the API's OpenAPI doc
+cd src/AppointMe.Frontend && yarn generate:api
 ```
 
-## Architecture
+Deploy the full stack in containers (Podman + Cloudflare Tunnel):
 
-This is a **modular monolithic** .NET 10 application following Domain-Driven Design principles.
-
-### Module Structure
-```
-src/
-├── AppointMe.Api/           # ASP.NET Core API entry point
-├── AppointMe.Aspire/        # .NET Aspire orchestrator for local dev
-├── AppointMe.Shared/        # Shared domain abstractions and value objects
-├── Identity/AppointMe.Identity/           # User auth module (Keycloak)
-├── Organizations/AppointMe.Organizations/ # Companies & employees
-├── CRM/AppointMe.Crm/                     # Customer management
-├── Booking/AppointMe.Booking.Contracts/   # Booking contracts (TBD)
-└── AppointMe.Frontend/      # React/Vite/TypeScript frontend
+```bash
+cd deploy
+cp .env.example .env          # then edit .env
+podman-compose --env-file .env up -d --build
 ```
 
-### Key Patterns
+See **`README.md` → "Deploy on a Fedora server"** for the full walkthrough.
 
-**Bounded Contexts**: Each module has its own `DbContext` with separate database schema:
-- `IdentityDbContext` (schema: "identity")
-- `OrganizationsDbContext` (schema: "organizations")
-- `CrmDbContext` (schema: "crm")
+---
 
-**Vertical Slice Architecture**: Inside each module, code is organized by feature/use case rather than by technical layer. Each slice owns everything required to serve that use case and lives in its own folder named after the action (verb-first, CRUD-style for projections).
+## Conventions & gotchas
 
-Example layout:
-```
-Customers/
-├── Customer.cs                       # aggregate root
-├── CustomerId.cs
-├── RegisterCustomer/                 # one slice per use case
-│   ├── RegisterCustomer.cs           # domain factory (extension on aggregate)
-│   ├── RegisterCustomerCommand.cs
-│   ├── RegisterCustomerCommandHandler.cs
-│   ├── RegisterCustomerEndpoint.cs
-│   └── RegisterCustomerRequest.cs
-├── UpdateCustomer/
-├── DeleteCustomer/
-├── GetCustomers/                     # queries are slices too
-└── Database/                         # shared EF config / Dapper queries
-```
+- **Migrations apply automatically at startup** via a hosted service
+  (`DatabaseMigrationService`). You don't run them by hand; the app migrates each
+  registered `DbContext` on boot. A container deploy needs no separate migration
+  step.
+- **Demo seeding is config-gated, not environment-gated.** Setting
+  `Demo:Enabled = true` seeds demo data even in Production. It is off by default
+  in `appsettings.json`.
+- **Reads use Dapper, writes use EF.** Don't "tidy up" a Dapper read query into
+  the EF model or vice versa — the split is intentional.
+- **Cross-module calls go through `*.Contracts` and messages only.** If you find
+  yourself wanting a project reference into another module's internals, that's
+  the smell the module boundary is meant to catch.
+- **Auth cookie is `Secure`-always.** Login therefore requires HTTPS; there is no
+  supported plain-HTTP login path (the deployment terminates TLS at Cloudflare).
+- **The API serves the SPA.** In a published build the React bundle is copied to
+  `wwwroot` and served with an `index.html` fallback; there is no separate
+  front-end server in production.
 
-Slice rules:
-- Event handlers live in the slice whose domain operation they invoke (e.g. `CustomerRegisteredEventHandler` sits in `CreateAttendee/` because it calls `Attendee.Create`), **not** in a shared `Handlers/` folder.
-- Domain operations on aggregates are expressed as extension methods co-located with the slice (`extension(Aggregate)` for factories, `extension(Aggregate instance)` for mutators) — see `RegisterCustomer.cs`, `UpdateCustomer.cs`, `DeleteCustomer.cs`.
-- Use CRUD-style verbs (`Create`, `Update`, `Delete`) for projection/synchronization slices, and domain-specific verbs (`Register`, `Schedule`, `Cancel`) for slices that own business intent on the source aggregate.
-- Shared infrastructure (EF type configurations, Dapper queries reused across slices, ID types, the aggregate itself) lives alongside the slices in the parent feature folder, not inside any one slice.
-
-**Endpoint Convention**: Implement `IEndpoint` interface. Endpoints are auto-discovered via Scrutor.
-
-**Module Registration**: Each module exposes extension methods:
-```csharp
-.AddIdentityModule()
-.AddCompaniesModule()
-.AddCrmModule()
-```
-
-**Domain Events**: Aggregate roots inherit from `AggregateRoot` and raise `IDomainEvent` events. Wolverine handles async messaging.
-
-**CQRS Pattern**:
-- Writes use Entity Framework Core
-- Reads use Dapper with `IDbConnectionFactory`
-
-**Authentication**: Hybrid auth scheme (JWT Bearer for API calls, Cookies for browser flows) with Keycloak.
-
-**Strongly-Typed IDs**: Each module defines its own ID types wrapping `Guid` (e.g. `CustomerId`, `EmployeeId`, `AttendeeId`, `ServiceProviderId`). Cross-module projections use module-local ID types, not source module IDs.
-
-**Value Objects**: Value objects like `PersonName`, `DateOfBirth`, `Email`, `LongString` live in `AppointMe.Shared/Domain/Common`. They expose two kinds of constructors:
-
-- The **primary constructor** (`new DateOfBirth(value)`, `new Email(value)`, `new PersonName(...)`) is unvalidated. Reserve it for trusted paths only — EF Core materialization via `HasConversion`, Dapper projections, and similar infrastructure code.
-- **Validating factories** live in a companion `…Factory` static class as extension methods on the value object's type. Always construct value objects from untrusted input (HTTP commands, event payloads from other modules, etc.) via these factories — never via the primary constructor.
-  - `Create(...)` — validates and throws `ValidationException` on invalid input.
-  - `CreateOrNull(...)` — returns `null` when the input is null, otherwise delegates to `Create`.
-
-Example (from `RegisterCustomerCommandHandler`):
-```csharp
-var customer = Customer.Register(
-    companyId: companyId,
-    name: PersonName.Create(command.FirstName, command.LastName),
-    dateOfBirth: DateOfBirth.CreateOrNull(command.DateOfBirth, timeProvider),
-    gender: Gender.ParseOrNull(command.Gender),
-    email: Email.CreateOrNull(command.Email),
-    registrationDate: timeProvider.GetUtcNow()
-);
-```
-
-The same rule applies inside event handlers that build projections from cross-module events — the payload is untrusted, so reconstruct value objects via `Create` / `CreateOrNull`, not `new`.
-
-**Permission Auto-Discovery**: Permissions are auto-discovered by assembly scanning. Define permissions as `public static readonly Permission` fields on static classes ending with `Permissions`. Register via `.AddPermissions(assembly)` which also auto-discovers `IDefaultGrantPolicy` implementations via Scrutor.
-
-### Naming Conventions
-
-**Async suffix**: In async-only APIs, asynchronous behavior is implicit; the `Async` suffix is used only to disambiguate from synchronous alternatives.
-
-**Lambda parameters**: Use full, descriptive names — not one- or two-letter abbreviations. Prefer `appointment => appointment.Id` over `a => a.Id`, `customer => customer.Name` over `c => c.Name`. Applies especially to EF `IEntityTypeConfiguration`, LINQ chains, and converter lambdas. Exceptions: single-char names are fine when the lambda is purely structural and the identifier carries no domain meaning (e.g. `x => x` in a trivial selector), but default to the full name.
-
-**Test methods**: Use `snake_case` with a `should_` or descriptive verb prefix that reads as a sentence describing the expected behavior. Test classes are non-sealed. Example:
-```csharp
-public class PermissionResolverTests
-{
-    [Fact]
-    public void should_deny_permission_when_any_role_denies() { ... }
-
-    [Fact]
-    public void should_return_empty_when_no_roles() { ... }
-}
-```
-
-### Tech Stack
-- **Backend**: .NET 10, C# 14, EF Core 10, Wolverine 5.9, Dapper
-- **Frontend**: React 19, TypeScript 5.8, Vite 7, Tailwind CSS 4, TanStack Query
-- **Infrastructure**: SQL Server 2022, Keycloak, Azure Service Bus Emulator
-
-## Local Development Services
-
-When running via Aspire:
-- **SQL Server**: localhost:60740 (sa/Password1)
-- **Keycloak**: http://localhost:8082 (admin/admin)
-- **Mailpit SMTP**: localhost:1026, Web UI: http://localhost:8026
-- **Frontend**: https://localhost:5173
 
 
 ================================================================================
 FILE: compose.yaml
-SIZE: 3.2 KB
-MODIFIED: 06/11/2026 13:31:28
+SIZE: 8.74 KB
+MODIFIED: 06/11/2026 17:02:41
 ================================================================================
 
-# Docker Compose for AppointMe's local backing services.
+# ─────────────────────────────────────────────────────────────────────────
+# AppointMe — full single-host deployment for Podman + podman-compose.
 #
-# This starts the SAME dependencies the .NET Aspire host (src/AppointMe.Aspire)
-# brings up — SQL Server, Keycloak, and Mailpit — on the SAME ports and with the
-# SAME credentials. Use it when you'd rather run the API and frontend yourself
-# instead of having Aspire orchestrate everything. See the README "Quick start".
+# Unlike the repo-root compose.yaml (which starts ONLY the backing services for
+# local development), this file runs the ENTIRE application in containers — the
+# API (which also serves the built React SPA), SQL Server, Keycloak, Mailpit —
+# plus a Cloudflare Tunnel that publishes it on the internet over HTTPS.
 #
-# Unlike Aspire, Compose runs ONLY the dependencies. You start the API and the
-# frontend yourself:
-#   dotnet run --project src/AppointMe.Api      # API on https://localhost:7233
-#   cd src/AppointMe.Frontend && yarn dev        # frontend on https://localhost:5173
+# Bring everything up with a single command:
+#     cp .env.example .env        # then edit .env
+#     podman-compose --env-file .env up -d --build
 #
-# One-time setup before the first `docker compose up`: export the trusted
-# ASP.NET Core HTTPS dev certificate that Keycloak serves on https://localhost:8082
-# (so both the API and your browser trust it — exactly what Aspire does for you):
+# Tear it down with:
+#     podman-compose --env-file .env down            # keep data
+#     podman-compose --env-file .env down -v         # wipe data too
 #
-#   dotnet dev-certs https --trust
-#   dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
-#
-# That writes docker/keycloak/certs/keycloak.crt and keycloak.key (git-ignored).
-
+# SELinux: there are deliberately NO bind mounts here. Config that other stacks
+# would bind-mount (the Keycloak realm, the config script) is baked into the
+# custom Keycloak image instead, so there is nothing to relabel with :z/:Z. The
+# only volumes are *named* volumes, which Podman labels for SELinux on its own.
+# The `:U` you see on the two data volumes is a separate thing — it fixes file
+# OWNERSHIP, not SELinux labels (see the comments on those volumes).
+# ─────────────────────────────────────────────────────────────────────────
 name: appointme
 
 services:
+
+  # ── Database ──────────────────────────────────────────────────────────
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2025-CU1-ubuntu-24.04
-    container_name: appointme-sql
     environment:
       ACCEPT_EULA: "Y"
-      MSSQL_SA_PASSWORD: "Password1"
-    ports:
-      - "60740:1433"
+      MSSQL_SA_PASSWORD: "${SA_PASSWORD}"
+      MSSQL_PID: "Developer"
     volumes:
-      - sqlserver-data:/var/opt/mssql
+      # ":U" tells Podman to chown the volume to the UID the SQL Server process
+      # runs as inside the container (mssql, uid 10001). Without it, a *rootless*
+      # Podman run leaves the volume owned by a UID the container can't write to,
+      # and SQL Server dies on boot with an "Anonymous errorlog" / permission
+      # error. ":U" makes the same compose file work rootful AND rootless.
+      - sqlserver-data:/var/opt/mssql:U
     healthcheck:
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q \"SELECT 1\" -b -o /dev/null"]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 20s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
 
-  keycloak:
-    image: quay.io/keycloak/keycloak:26.6
-    container_name: appointme-keycloak
-    command: ["start-dev", "--import-realm"]
-    environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
-      KC_HEALTH_ENABLED: "true"
-      KC_HTTPS_PORT: "8443"
-      KC_HTTPS_CERTIFICATE_FILE: /opt/keycloak/certs/keycloak.crt
-      KC_HTTPS_CERTIFICATE_KEY_FILE: /opt/keycloak/certs/keycloak.key
-    ports:
-      - "8082:8443"
-    volumes:
-      - keycloak-data:/opt/keycloak/data
-      - ./src/AppointMe.Aspire/appointme-realm.json:/opt/keycloak/data/import/appointme-realm.json:ro
-      - ./docker/keycloak/certs/keycloak.crt:/opt/keycloak/certs/keycloak.crt:ro
-      - ./docker/keycloak/certs/keycloak.key:/opt/keycloak/certs/keycloak.key:ro
-    healthcheck:
-      # The image ships no curl/wget, so probe the HTTPS port with bash's /dev/tcp.
-      # The port only accepts connections once the realm import has finished.
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8443"]
-      interval: 10s
-      timeout: 5s
-      retries: 15
-      start_period: 20s
-
+  # ── Mail catcher ──────────────────────────────────────────────────────
+  # Sign-up sends a "verify your email & set your password" link. Without
+  # somewhere for that mail to land, a brand-new account can never set a
+  # password and can never log in. Mailpit catches it; publish mail.<domain>
+  # → mailpit:8025 in the tunnel so you can click the link.
   mailpit:
-    image: axllent/mailpit
-    container_name: appointme-mailpit
+    image: docker.io/axllent/mailpit
     networks:
       default:
-        # The imported realm sends SMTP to host "Mailpit" (appointme-realm.json
-        # -> smtpServer.host), so expose that name on the Compose network.
         aliases:
+          # The realm's SMTP server host is literally "Mailpit", so expose that
+          # name on the network for Keycloak to find.
           - Mailpit
-    ports:
-      - "8026:8025"   # web UI  -> http://localhost:8026
-      - "1026:1025"   # SMTP
+    restart: unless-stopped
+
+  # ── Identity provider ─────────────────────────────────────────────────
+  keycloak:
+    build:
+      context: ..
+      dockerfile: deploy/keycloak/Containerfile
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: "${KC_ADMIN_USER}"
+      KC_BOOTSTRAP_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD}"
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_ENABLED: "true"
+      # The tunnel terminates TLS at Cloudflare and forwards plain HTTP to us,
+      # setting X-Forwarded-Proto/Host. Trusting those headers is what lets
+      # Keycloak know it is "really" being reached over HTTPS at the public URL.
+      KC_PROXY_HEADERS: "xforwarded"
+      # The public origin Keycloak should put in issued tokens (the `iss` claim)
+      # and in the login redirect. MUST match what the browser actually hits.
+      KC_HOSTNAME: "${AUTH_PUBLIC_URL}"
+      KC_HOSTNAME_STRICT: "false"
+    volumes:
+      # start-dev keeps its realm/users in an H2 file under data/; persist it so
+      # accounts survive restarts. ":U" for the same rootless-ownership reason
+      # as SQL Server above.
+      - keycloak-data:/opt/keycloak/data:U
+    healthcheck:
+      # The image ships no curl/wget; bash's /dev/tcp probes the management port,
+      # which opens once Keycloak has started.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── One-shot: allow-list the public URL on the Keycloak clients ────────
+  # Runs the script baked into the Keycloak image, then exits. It self-waits
+  # for Keycloak, so exact start ordering doesn't matter.
+  keycloak-config:
+    build:
+      context: ..
+      dockerfile: deploy/keycloak/Containerfile
+    entrypoint: ["/bin/bash", "/opt/appointme/configure-clients.sh"]
+    environment:
+      KC_ADMIN_USER: "${KC_ADMIN_USER}"
+      KC_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD}"
+      APP_PUBLIC_URL: "${APP_PUBLIC_URL}"
+    depends_on:
+      - keycloak
+    restart: "no"
+
+  # ── The application (API + bundled React SPA) ─────────────────────────
+  api:
+    build:
+      # The Dockerfile does `COPY . .` and builds the frontend from src/, so the
+      # build context is the repo root, not src/AppointMe.Api. (Podman reads a
+      # file named Dockerfile or Containerfile interchangeably.)
+      context: ..
+      dockerfile: src/AppointMe.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:8080"
+
+      # Database — internal service name, not localhost.
+      ConnectionStrings__AppointMeSql: "Server=sqlserver,1433;Database=AppointMe;User ID=sa;Password=${SA_PASSWORD};TrustServerCertificate=True;Encrypt=False"
+
+      # Where the API sends the browser back to after login, and where the
+      # password-setup email link points. This is the app's own public origin.
+      Frontend__BaseUrl: "${APP_PUBLIC_URL}"
+
+      # OIDC. Authority is browser-facing (the browser is redirected there), so
+      # it must be the PUBLIC Keycloak URL and must serve HTTPS — hence
+      # RequireHttpsMetadata=true.
+      Authentication__Provider: "Keycloak"
+      Authentication__RequireHttpsMetadata: "true"
+      Authentication__Keycloak__Authority: "${AUTH_PUBLIC_URL}/realms/appointme"
+      Authentication__Keycloak__FrontendClientId: "appointme-frontend"
+      Authentication__Keycloak__FrontendClientSecret: "${KC_FRONTEND_CLIENT_SECRET}"
+      Authentication__Keycloak__ApiAudience: "appointme-api"
+
+      # Admin API for provisioning users at sign-up. This is a back-channel call
+      # (server → Keycloak), so it can — and should — use the fast internal URL.
+      KeycloakAdmin__BaseUrl: "http://keycloak:8080"
+      KeycloakAdmin__Realm: "appointme"
+      KeycloakAdmin__ClientId: "appointme-api"
+      KeycloakAdmin__ClientSecret: "${KC_API_CLIENT_SECRET}"
+
+      # Durable messaging on top of SQL Server (no external broker needed).
+      Wolverine__Transport: "SqlDurable"
+
+      Demo__Enabled: "${SEED_DEMO_DATA}"
+    depends_on:
+      - sqlserver
+      - keycloak
+    # On the very first boot the API may start before SQL Server has finished
+    # initialising; its startup migration step will then fail and the process
+    # exits. `restart: unless-stopped` simply brings it back, and within a
+    # restart or two SQL Server is ready and migrations apply cleanly. This is
+    # intentional: a container should tolerate its dependencies not being up yet.
+    restart: unless-stopped
+
+  # ── Public HTTPS via Cloudflare Tunnel (named tunnel, token auth) ──────
+  # The connector dials OUT to Cloudflare, so the server needs no open inbound
+  # ports and no public IP. Routing (which hostname → which service) is set in
+  # the Cloudflare dashboard; see .env.example.
+  cloudflared:
+    image: docker.io/cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${TUNNEL_TOKEN}"]
+    depends_on:
+      - api
+      - keycloak
+      - mailpit
+    restart: unless-stopped
 
 volumes:
   sqlserver-data:
@@ -2546,16 +3226,16 @@ volumes:
 
 ================================================================================
 FILE: Directory.Build.props
-SIZE: 0.49 KB
-MODIFIED: 06/11/2026 13:31:28
+SIZE: 0.47 KB
+MODIFIED: 06/11/2026 17:07:47
 ================================================================================
 
 <Project>
 
   <PropertyGroup>
-    <Company>BravoDev</Company>
-    <Authors>BravoDev</Authors>
-    <RepositoryUrl>https://github.com/bravodev/appointme.git</RepositoryUrl>
+    <Company>collabskus</Company>
+    <Authors>kushal</Authors>
+    <RepositoryUrl>https://github.com/collabskus/appointme.git</RepositoryUrl>
     <RepositoryType>Git</RepositoryType>
     <TargetFramework>net10.0</TargetFramework>
     <LangVersion>14</LangVersion>
@@ -2643,6 +3323,113 @@ MODIFIED: 06/11/2026 13:31:28
 ================================================================================
 
 [EMPTY FILE]
+
+
+================================================================================
+FILE: docker/keycloak/configure-clients.sh
+SIZE: 2.77 KB
+MODIFIED: 06/11/2026 17:05:48
+================================================================================
+
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────
+# Register this deployment's public URL as a valid OIDC redirect target.
+#
+# THE PROBLEM THIS SOLVES
+# Keycloak refuses any `redirect_uri` that a client hasn't explicitly allow-
+# listed — that allow-list is the entire point of the redirect-URI check (it
+# stops an attacker from bouncing a victim's authorization code to a site they
+# control). The realm export (appointme-realm.json) ships with localhost URLs,
+# which are right for local development but wrong for a server reachable at,
+# say, https://app.example.com. Rather than fork the 86 KB realm file for every
+# deployment, we add the public URL here, once, right after import.
+#
+# Two clients need it:
+#   • appointme-frontend → used by the API's OIDC login redirect
+#       (browser → Keycloak → back to APP_PUBLIC_URL/signin-oidc)
+#   • appointme-api      → used as the client for the "verify email / set
+#       password" link, whose redirect lands on APP_PUBLIC_URL/auth/login
+#
+# This script is idempotent: it SETS the full desired list every time, so
+# re-running it (every `up`) just reasserts the same state.
+# ─────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+KCADM=/opt/keycloak/bin/kcadm.sh
+SERVER=http://keycloak:8080      # internal address on the Podman network
+REALM=appointme
+
+echo "keycloak-config: waiting for Keycloak to accept admin logins..."
+# Keycloak takes a little while to import the realm and open its admin API.
+# Poll until login succeeds rather than depending on healthcheck timing.
+until "$KCADM" config credentials \
+        --server "$SERVER" --realm master \
+        --user "$KC_ADMIN_USER" --password "$KC_ADMIN_PASSWORD" >/dev/null 2>&1; do
+  sleep 3
+done
+echo "keycloak-config: connected."
+
+configure_client() {
+  local client_id="$1"
+  local uuid
+  uuid="$("$KCADM" get clients -r "$REALM" -q "clientId=$client_id" \
+            --fields id --format csv --noquotes | tr -d '\r\n')"
+
+  if [ -z "$uuid" ]; then
+    echo "keycloak-config: WARNING — client '$client_id' not found, skipping."
+    return
+  fi
+
+  "$KCADM" update "clients/$uuid" -r "$REALM" \
+    -s "redirectUris=[\"https://localhost:5173/*\",\"${APP_PUBLIC_URL}/*\"]" \
+    -s "webOrigins=[\"https://localhost:5173\",\"${APP_PUBLIC_URL}\"]"
+
+  echo "keycloak-config: '$client_id' now accepts redirects to ${APP_PUBLIC_URL}"
+}
+
+configure_client appointme-frontend
+configure_client appointme-api
+
+echo "keycloak-config: done."
+
+
+
+================================================================================
+FILE: docker/keycloak/Containerfile
+SIZE: 1.86 KB
+MODIFIED: 06/11/2026 17:07:26
+================================================================================
+
+# ─────────────────────────────────────────────────────────────────────────
+# A self-contained Keycloak image for AppointMe.
+#
+# It is just upstream Keycloak plus two files baked in:
+#   1. the realm export  → imported automatically on first start
+#   2. the post-import client-configuration script (run by a one-shot sidecar)
+#
+# WHY bake them in instead of bind-mounting from the host?
+# On Fedora, SELinux blocks a container from reading host files unless the
+# mount carries a relabel option (:z for shared, :Z for private). Baking the
+# files into the image means there are NO bind mounts in the whole stack, so
+# there is nothing to relabel — the SELinux :z/:Z question simply never comes
+# up for the core services. (The README explains :z/:Z anyway, for the day you
+# DO add a bind mount.)
+#
+# Build context is the REPOSITORY ROOT (see deploy/compose.yaml), which is why
+# the COPY paths below start from the repo root.
+# ─────────────────────────────────────────────────────────────────────────
+FROM quay.io/keycloak/keycloak:26.6
+
+# Keycloak imports every realm file under this directory when started with
+# `--import-realm`. Import is a no-op once the realm already exists in the DB,
+# so this is safe on every boot.
+COPY src/AppointMe.Aspire/appointme-realm.json /opt/keycloak/data/import/appointme-realm.json
+
+# Runs once after Keycloak is up to allow-list this deployment's public URL as
+# an OIDC redirect target (the realm only ships localhost URLs). See
+# deploy/compose.yaml → the `keycloak-config` service.
+COPY deploy/keycloak/configure-clients.sh /opt/appointme/configure-clients.sh
+
 
 
 ================================================================================
@@ -5567,273 +6354,269 @@ MODIFIED: 06/11/2026 13:31:28
 
 ================================================================================
 FILE: README.md
-SIZE: 12.52 KB
-MODIFIED: 06/11/2026 16:07:09
+SIZE: 11.11 KB
+MODIFIED: 06/11/2026 17:02:24
 ================================================================================
 
 # AppointMe
 
-A personal **learning sandbox** — a multi-tenant appointment-booking app I use to
-explore advanced .NET and React patterns end to end. It's a modular monolith
-(.NET 10 + React 19) with the genuinely hard parts wired up: multi-tenancy,
-hybrid authentication, a permission engine, CQRS with domain events, durable
-messaging, and a typed frontend generated from the backend's OpenAPI contract.
+A multi-tenant **appointment-booking SaaS**, built as a **.NET 10 modular
+monolith** with a **React 19** front end.
 
-## What this is (and isn't)
+This is a **personal learning sandbox**. It is a deliberately over-engineered
+worked example: a place to practise modern back-end architecture — modular
+monoliths, vertical slices, CQRS, domain events, a permission engine,
+fail-closed multi-tenancy — and to write the reasoning down so it teaches.
+It is not a product and comes with no warranty. Treat the code as a reference,
+not as something to run a real business on.
 
-This repo is **public so it's easy to read and learn from**, but it's a personal
-project, not a product or a starter template:
+If you want the architecture explained from first principles — what each pattern
+is, *why* it's used here, and where it's deliberately taken too far — start with
+**[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
 
-- **Not a template.** There's no "clone-and-build-your-startup" intent. It's where
-  I try ideas — some patterns here are deliberately more elaborate than a real
-  product would need, because the point is to learn them.
-- **No support, no roadmap, no contribution process.** Issues and PRs aren't being
-  solicited. Read it, borrow from it, fork it — all fine (it's MIT) — but I'm
-  building it for myself.
-- **It may break or change shape without notice.** `main` is my working branch.
+---
 
-If you landed here looking for production-grade reference patterns, plenty of them
-are here and they work — just treat them as study material, not a supported library.
+## What's in the box
 
-## What's inside
+| Concern        | Choice                                                                 |
+|----------------|------------------------------------------------------------------------|
+| Language       | C# 14 on .NET 10; TypeScript on the front end                          |
+| Web            | ASP.NET Core minimal APIs, versioned with Asp.Versioning               |
+| Messaging      | **WolverineFx 6** (in-process mediator + **SQL-Server durable** transport) |
+| Writes         | EF Core 10 (aggregates)                                                |
+| Reads          | Dapper (hand-written SQL → DTOs)                                        |
+| Background jobs| Hangfire                                                               |
+| Identity       | **Keycloak 26** (OIDC); Microsoft Entra External ID also supported     |
+| Database       | **SQL Server 2025**                                                    |
+| Mail (local)   | Mailpit                                                                |
+| Front end      | React 19, Vite, Tailwind 4, TanStack Query v5, React Hook Form, Zod 4, FullCalendar |
+| API client     | Generated from OpenAPI with **orval**                                  |
+| Local orchestration | **.NET Aspire**                                                   |
+| Observability  | OpenTelemetry                                                          |
 
-- **Modular monolith** — `Identity`, `Organizations`, `CRM`, and `Booking`, each a
-  bounded context with its own `DbContext` and database schema, organized by
-  vertical slice (one folder per use case: command, handler, endpoint, request).
-- **Hybrid authentication** — Keycloak (OIDC) locally, with JWT Bearer for API
-  calls and cookies for browser flows. Sign-up, email verification, and password
-  reset are handled by the app, not by hitting Keycloak directly. An **Entra
-  External ID** path is also wired in as the cloud-identity option.
-- **Multi-tenancy** — company resolved from the `X-Company-Id` header, enforced two
-  ways: EF Core query filters at the data layer (tenant isolation *fails closed* —
-  no company context means no rows), and a handler guard that rejects work with no
-  active company.
-- **CQRS + DDD** — writes go through EF Core aggregates that raise domain events;
-  reads go through Dapper. Async messaging runs on **Wolverine**, which publishes
-  domain events out of the EF change tracker. Locally the transport is a **durable
-  SQL Server queue** (no external broker); **Azure Service Bus** is available as an
-  opt-in transport for cloud.
-- **Permission engine** — permissions are auto-discovered by assembly scanning.
-  Effective permissions are computed from per-role default grants plus per-company
-  overrides, with conflicts arbitrated by a pluggable voting policy
-  (`DenyWins` / `GrantWins`).
-- **Background jobs** — Hangfire runs the recurring reconciliation jobs that keep
-  each module's local projections in sync with the others.
-- **Typed frontend** — React 19 + Vite + Tailwind 4, with TanStack Query hooks and
-  TypeScript types generated directly from the backend OpenAPI spec via **orval**.
-- **One-command local stack** — .NET Aspire orchestrates SQL Server, Keycloak,
-  Mailpit, the API, and the frontend, applying EF migrations and seeding demo data
-  automatically. A matching `compose.yaml` runs the same backing services if you'd
-  rather launch the API and frontend yourself.
+Modules: **Identity**, **Organizations** (companies, roles, permissions),
+**CRM** (customers), **Booking** (services, providers, availability,
+appointments).
 
-## Quick start
+---
 
-Goal: clone the repo and have AppointMe running locally — backend, frontend,
-database, auth, and mail.
+## Run it locally
 
-You choose how the backing services (SQL Server, Keycloak, Mailpit) run:
+You need the .NET 10 SDK, Node.js 22 + Yarn, and a container engine (Docker or
+Podman).
 
-- **Option A — .NET Aspire** *(recommended)*: one command starts everything,
-  including the API and frontend.
-- **Option B — Docker Compose**: brings up only the backing services on the same
-  ports; you run the API and frontend yourself.
+### Option A — Aspire (one process orchestrates everything)
 
-Both produce an identical running app — same images, ports, credentials, and
-seeded data. Do the [prerequisites](#prerequisites) once, then follow either option.
+```bash
+dotnet run --project src/AppointMe.Aspire
+```
+
+Aspire starts SQL Server, Keycloak, and Mailpit, then launches the API and the
+front end already wired together. The Aspire dashboard prints the URLs.
+
+### Option B — Compose for the backing services, app by hand
+
+```bash
+# one-time: trust the ASP.NET dev cert and export it for Keycloak to serve
+dotnet dev-certs https --trust
+dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
+
+docker compose up -d                          # SQL Server, Keycloak, Mailpit
+dotnet run --project src/AppointMe.Api         # API  → https://localhost:7233
+cd src/AppointMe.Frontend && yarn dev          # SPA  → https://localhost:5173
+```
+
+The repo-root `compose.yaml` runs **only the dependencies** — it mirrors what
+Aspire brings up, on the same ports and credentials, for when you'd rather run
+the API and SPA yourself.
+
+> **Sign-up needs the mail catcher.** Creating an account sends a "verify your
+> email and set your password" link. Read it in Mailpit (the Compose setup
+> exposes its web UI on `http://localhost:8026`) and click through to set a
+> password — that's how a new account becomes usable.
+
+---
+
+## Deploy on a Fedora server
+
+This brings up the **entire application in containers** — API (which also serves
+the React SPA), SQL Server, Keycloak, Mailpit — and publishes it on the internet
+over HTTPS through a **Cloudflare Tunnel**, with **one command**. Everything is
+built from `Containerfile`s by Podman; nothing needs to be installed on the host
+except Podman itself.
+
+Files live in [`deploy/`](deploy/).
 
 ### Prerequisites
 
-| Requirement | Why | Notes |
-|---|---|---|
-| [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) | Builds and runs the API and the Aspire host | `dotnet --version` should report `10.x` |
-| [Docker](https://www.docker.com/products/docker-desktop/) (running) | Hosts SQL Server, Keycloak, and Mailpit containers | Docker Desktop or any OCI-compatible runtime |
-| [Node.js 22+](https://nodejs.org/) & [Yarn](https://yarnpkg.com/) | Builds and serves the React frontend | `corepack enable` gives you Yarn |
-| HTTPS dev certificate | Frontend and services run over HTTPS | `dotnet dev-certs https --trust` |
+```bash
+sudo dnf install -y podman podman-compose
+```
 
-> First run pulls container images and restores NuGet/Yarn packages, so it takes a
-> few minutes. Subsequent runs are fast — the SQL Server, Keycloak, and Mailpit
-> containers are persistent and reused across restarts.
+- A domain on a **Cloudflare** account (the free plan is fine). You'll publish
+  the app on three subdomains of it.
+- Roughly **3–4 GB of free RAM** (SQL Server alone wants ~2 GB) and a couple of
+  GB of disk for images and data.
+- An `x86_64` host. (The SQL Server image is x86-only; on ARM you'd swap in Azure
+  SQL Edge.)
 
-### Clone and trust the dev cert
+### 1. Create a Cloudflare named tunnel
 
-Both options start here:
+In the Cloudflare dashboard: **Zero Trust → Networks → Tunnels → Create a
+tunnel → Cloudflared**. Name it, and copy the **token** from the install command
+it shows you (the long `eyJ...` string after `--token`).
+
+Then, on the tunnel's **Public Hostnames** tab, add **three** routes. The
+*Service* is the in-container address — cloudflared resolves these names on the
+Podman network:
+
+| Public hostname        | Type | Service          |
+|------------------------|------|------------------|
+| `app.your-domain.com`  | HTTP | `api:8080`       |
+| `auth.your-domain.com` | HTTP | `keycloak:8080`  |
+| `mail.your-domain.com` | HTTP | `mailpit:8025`   |
+
+### 2. Configure the deployment
 
 ```bash
-git clone https://github.com/collabskus/appointme.git
-cd appointme
-
-# One-time: trust the local HTTPS dev cert (used by the API, frontend, and Keycloak)
-dotnet dev-certs https --trust
+cd deploy
+cp .env.example .env
 ```
 
-### Option A — .NET Aspire
+Edit `.env`:
+
+- `APP_PUBLIC_URL=https://app.your-domain.com`
+- `AUTH_PUBLIC_URL=https://auth.your-domain.com`
+- `TUNNEL_TOKEN=` ← the token from step 1
+- **Change every secret**: `SA_PASSWORD`, `KC_ADMIN_PASSWORD`. (The Keycloak
+  admin console is public at `auth.your-domain.com/admin`, so don't leave
+  `admin/admin`.)
+
+Every variable is documented inline in `.env.example`.
+
+### 3. Bring it up — one command
 
 ```bash
-# Start the whole stack — backing services, API, and frontend
-cd src/AppointMe.Aspire
-dotnet run
+podman-compose --env-file .env up -d --build
 ```
 
-**Prefer an IDE?** Open `AppointMe.sln` in Visual Studio or Rider, set
-**`AppointMe.Aspire`** as the startup project, and press **F5**.
+That's it. Podman builds the SPA and the API from source, builds a self-
+contained Keycloak image (realm baked in), starts the database and mail catcher,
+registers your public URL with Keycloak, and opens the tunnel.
 
-Either way, the [.NET Aspire dashboard](https://learn.microsoft.com/dotnet/aspire/fundamentals/dashboard/overview)
-opens automatically. Wait for every resource to turn **Running** (green) — the API
-waits for SQL Server and Keycloak to be healthy before it starts.
-
-What happens on startup, with no action from you:
-
-- SQL Server, Keycloak, and Mailpit containers come up.
-- The `appointme` Keycloak realm (clients, roles, mappers) is imported.
-- EF Core migrations are applied to every module's schema.
-- Demo customers and appointments are seeded (Development only).
-- The API starts, then the Vite frontend.
-
-### Option B — Docker Compose
-
-Compose runs only the backing services (SQL Server, Keycloak, Mailpit) — on the
-same ports, images, and credentials as Aspire. You run the API and frontend
-yourself.
+The **first** build is slow (it compiles the .NET solution and bundles the
+front end) and, on first boot, the API may restart a couple of times while SQL
+Server finishes initialising — that's expected and self-heals. Watch it settle
+with:
 
 ```bash
-# 1. One-time: export the trusted dev cert that Keycloak serves on https://localhost:8082
-./docker/keycloak/export-dev-cert.sh
-#    (Windows / no bash — run the command the script wraps:)
-#    dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
-
-# 2. Start the backing services and wait for them to report healthy
-docker compose up -d
-docker compose ps          # SQL Server and Keycloak should show "healthy"
-
-# 3. Run the API (applies migrations + seeds demo data on first start)
-dotnet run --project src/AppointMe.Api
-
-# 4. In a second terminal, run the frontend
-cd src/AppointMe.Frontend
-yarn install
-yarn dev
+podman-compose --env-file .env logs -f api
 ```
 
-Then open **https://localhost:5173**. To stop the services, `docker compose stop`
-(keeps data) or `docker compose down` (removes the containers; SQL Server and
-Keycloak data survive in named volumes — add `-v` to wipe them too).
+Open `https://app.your-domain.com`, create an account, read the verification
+email at `https://mail.your-domain.com`, set your password, and log in.
 
-EF Core migrations and demo-data seeding happen when **you** start the API in
-step 3 (same as Aspire — the API does this on startup, not Compose).
-
-### Where everything lives
-
-| Service | URL | Credentials |
-|---|---|---|
-| **Frontend (the app)** | https://localhost:5173 | sign up — see below |
-| Aspire dashboard | shown in the console at startup | — |
-| Keycloak admin console | https://localhost:8082 | `admin` / `admin` |
-| Mailpit (catches all outgoing email) | http://localhost:8026 | — |
-| API OpenAPI document | https://localhost:7233/openapi/v1.json | — |
-| SQL Server | `localhost:60740` | `sa` / `Password1` |
-
-> **About these credentials.** Every secret used in local development — the SQL `sa`
-> password, the Keycloak `admin` account, and the Keycloak client secrets in
-> `appsettings.Development.json` and `appointme-realm.json` — is a throwaway default.
-> It only protects containers running on your machine, and it's committed on purpose
-> so the stack runs with zero setup. These are safe in a public repo, but **never
-> reuse them anywhere real**. Any cloud secrets live in Azure Key Vault and are
-> injected at deploy time (see [`infra/`](./infra)). A `gitleaks` workflow scans
-> every push/PR to catch any *real* secret that slips in.
-
-### Create your first account
-
-The app manages its own sign-up — you don't register through Keycloak directly.
-
-1. Open **https://localhost:5173** and go to **Sign up** (`/auth/signup`).
-2. Submit the form. AppointMe provisions your user in Keycloak and sends a
-   verification email.
-3. Open **Mailpit at http://localhost:8026**, find the verification email, and click
-   the link. (No real mail is sent — Mailpit catches everything locally.)
-4. Log in with your new credentials.
-5. Complete **onboarding** to create your company. You now have a working,
-   multi-tenant AppointMe instance with demo data to explore.
-
-## Project layout
-
-```
-src/
-├── AppointMe.Aspire/        # .NET Aspire orchestrator — the F5 entry point for local dev
-├── AppointMe.Api/           # ASP.NET Core API host (endpoints auto-discovered)
-├── AppointMe.Shared/        # Shared domain abstractions, value objects, infrastructure
-├── Identity/                # Authentication & user provisioning (Keycloak / Entra External ID)
-├── Organizations/           # Companies, employees, invitations, onboarding, permissions
-├── CRM/                     # Customer management
-├── Booking/                 # Appointments, attendees, service providers, scheduling
-└── AppointMe.Frontend/      # React + Vite + TypeScript SPA
-```
-
-The codebase follows Domain-Driven Design with **vertical slice architecture** —
-each use case owns its command, handler, endpoint, and request/response in a single
-folder. For the full architecture guide, conventions, and patterns, see
-[`CLAUDE.md`](./CLAUDE.md).
-
-## Common commands
+Tear down:
 
 ```bash
-# Full stack (recommended) — from src/AppointMe.Aspire
-dotnet run
-
-# Backing services only, without Aspire (see Quick start → Option B)
-docker compose up -d        # start SQL Server, Keycloak, Mailpit
-docker compose ps           # check health
-docker compose down         # stop and remove containers (data volumes persist)
-
-# Backend only
-dotnet build AppointMe.sln
-dotnet run --project src/AppointMe.Api
-
-# Tests (all unit tests — domain rules + the permission engine)
-dotnet test
-dotnet test --filter "FullyQualifiedName~TestName"   # a single test
-
-# Frontend — from src/AppointMe.Frontend
-yarn install
-yarn dev            # dev server on https://localhost:5173
-yarn build          # production build
-yarn lint           # ESLint
-yarn generate:api   # regenerate the typed API client from the backend OpenAPI spec
+podman-compose --env-file .env down        # keep data (named volumes)
+podman-compose --env-file .env down -v     # also wipe the database & Keycloak data
 ```
 
-> When you change the backend contract (endpoints, request/response shapes, routes,
-> or auth attributes), restart the API and run `yarn generate:api` to keep the
-> frontend's typed client in sync. A reachable-but-stale backend silently produces a
-> stale client.
+### Rootful vs rootless
 
-## Tech stack
+The happy path on a dedicated server is **rootful** Podman, which avoids
+user-namespace UID surprises with the database volume:
 
-- **Backend:** .NET 10, C# 14, EF Core 10, Wolverine 6, Dapper, Hangfire, Scrutor
-- **Frontend:** React 19, TypeScript 5, Vite, Tailwind CSS 4, TanStack Query v5,
-  React Hook Form + Zod, FullCalendar, orval (OpenAPI → typed client)
-- **Messaging:** Wolverine on a durable SQL Server transport locally; Azure Service
-  Bus as an opt-in transport
-- **Local stack:** SQL Server 2025, Keycloak, Mailpit — orchestrated with .NET Aspire
-- **Observability:** OpenTelemetry (traces/metrics exported to the Aspire dashboard)
+```bash
+sudo podman-compose --env-file .env up -d --build
+```
 
-## CI & deployment
+The compose file is also written to work **rootless** — the `:U` flag on the two
+data volumes (see below) chowns them to the right in-container user so SQL Server
+and Keycloak can write to them. If you hit a database permission error rootless,
+that flag is the fix; rerunning rootful is the quick escape hatch.
 
-The repo includes more pipeline than a sandbox strictly needs, kept as a working
-reference:
+### A note on SELinux and `:z` / `:Z` (Fedora)
 
-- **`secret-scan`** — gitleaks on every push/PR. Useful regardless of deployment.
-- **`devtest`** — build, test, and frontend lint/build on every push/PR, followed by
-  jobs that build a container image, push it to Azure Container Registry, and deploy
-  to Azure App Service. **Those deploy jobs require Azure secrets and live
-  infrastructure** ([`infra/`](./infra) provisions it via Bicep); without them, only
-  the build-and-test stage is meaningful. If you fork this, expect the deploy jobs to
-  be red until you supply your own Azure setup (or disable them).
+On Fedora, SELinux stops a container from reading host files through a bind mount
+unless the mount is relabelled:
+
+- **`:z`** — relabel the content as **shared** (multiple containers may use it).
+- **`:Z`** — relabel as **private** to a single container. More secure; use it
+  unless two containers genuinely share the path.
+
+```yaml
+volumes:
+  - ./some/host/dir:/in/container:Z      # private to this container
+```
+
+**This deployment has no bind mounts**, so there is nothing to relabel — the
+realm export and the config script are baked into the Keycloak image instead, and
+all persistent data lives in **named volumes** (which Podman labels for SELinux
+automatically). If you later add a bind mount (say, a `cloudflared` config file),
+add `:Z` to it. The `:U` you'll see on the data volumes is unrelated to SELinux —
+it fixes file **ownership**, not the security label.
+
+### Why a *named* tunnel — and not `try cloudflare` (the random URL)
+
+The quick `cloudflared tunnel --url http://api:8080` command hands you a fresh
+random `https://something.trycloudflare.com` address each run, with no account
+and no domain. It's great for showing a colleague a static site in ten seconds.
+
+**It cannot carry this app's login**, and the reason is worth understanding,
+because it's a property of OIDC, not a Cloudflare limitation:
+
+1. **The login is a browser redirect.** Logging in sends the browser *to
+   Keycloak* and back. So Keycloak itself has to be reachable at a public URL the
+   browser can hit — but a quick tunnel gives you exactly **one** URL, pointed at
+   one service. You can't reach both the app and Keycloak through it.
+2. **OIDC pins itself to a known hostname.** Every token Keycloak issues stamps
+   the issuer (`iss`) with its public hostname, and the API rejects tokens whose
+   issuer doesn't match what it was configured to trust. A hostname that's
+   different on every boot can't be configured ahead of time.
+3. **Redirect URIs are allow-listed.** Keycloak only redirects back to URLs a
+   client has pre-registered (that check is what stops an attacker stealing your
+   authorization code). You can't pre-register a hostname you won't know until
+   the tunnel is already running.
+
+In short, **interactive OIDC login needs a stable, known-in-advance hostname**,
+and a named tunnel gives you exactly that for free. (You *could* make the random
+URL work by discovering it at boot and rewriting Keycloak's hostname, the API's
+authority, and the clients' redirect URIs on every start — but that's a pile of
+fragile glue that teaches a pattern you should never ship. The honest answer is:
+use a named tunnel. It's the same `cloudflared`, same free plan, one extra DNS
+record.)
+
+You *can* still point a quick tunnel at `api:8080` to confirm the tunnel works
+and watch the login page render — just expect the login round-trip itself to
+fail until you move to a named tunnel.
+
+### Tempted to switch login to a username/password POST instead?
+
+It would make the random-URL problem vanish (the browser would only ever talk to
+the app). Don't. That's OAuth's **Resource Owner Password Credentials** /
+"direct grant" flow — deprecated in OAuth 2.1, and it throws away SSO, MFA,
+social login, and the principle that your app never handles the user's IdP
+password. It's a textbook example of a shortcut that's an anti-pattern;
+`docs/ARCHITECTURE.md` walks through why.
+
+---
+
+## Continuous integration
+
+GitHub Actions builds and unit-tests the solution on push. Note the workflow also
+contains **publish-image** and **deploy-to-Azure** jobs gated on `main`; those
+require Azure secrets and federated credentials to be configured in the repo, and
+will fail on a fork without them. If you fork this to experiment, either add those
+secrets or gate/remove those jobs — they're independent of the Podman deployment
+above.
+
+---
 
 ## License
 
-Released under the [MIT License](./LICENSE) — free to use, modify, and distribute,
-including commercially. It builds on open-source libraries that remain under their
-own licenses; see [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md) for
-attribution and a note on Hangfire (LGPL-3.0).
+MIT. See [`LICENSE`](LICENSE).
 
 
 
@@ -15296,6 +16079,84 @@ MODIFIED: 06/11/2026 13:31:28
   },
   "iconLibrary": "lucide"
 }
+
+
+================================================================================
+FILE: src/AppointMe.Frontend/env.example
+SIZE: 3.84 KB
+MODIFIED: 06/11/2026 17:02:49
+================================================================================
+
+# ─────────────────────────────────────────────────────────────────────────
+# AppointMe deployment configuration.
+#
+# Copy this file to `.env` (which is git-ignored) and fill it in:
+#     cp .env.example .env
+#
+# Then bring the whole stack up with one command:
+#     podman-compose --env-file .env up -d --build
+#
+# Read deploy/compose.yaml and ../README.md ("Deploy on a Fedora server") for
+# the full walkthrough and the reasoning behind every value here.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+# ── Public hostnames ──────────────────────────────────────────────────────
+# The stable, public HTTPS URLs your Cloudflare *named* tunnel serves. These
+# MUST be real hostnames on a domain in your Cloudflare account (the free plan
+# is fine). They are stable across reboots — that stability is exactly what
+# OIDC login needs (see the README for why a random *.trycloudflare.com URL
+# can't work for interactive login).
+#
+#   APP_PUBLIC_URL   → the app itself (the API serves the React SPA)
+#   AUTH_PUBLIC_URL  → Keycloak (the browser is redirected here to log in)
+#
+# A third hostname, mail.<your-domain>, should point at Mailpit in the tunnel
+# ingress so you can read account-verification emails. The app needs no
+# variable for it.
+APP_PUBLIC_URL=https://app.example.com
+AUTH_PUBLIC_URL=https://auth.example.com
+
+
+# ── Cloudflare Tunnel ─────────────────────────────────────────────────────
+# Connector token for a *named* tunnel. Get it from:
+#   Cloudflare dashboard → Zero Trust → Networks → Tunnels → Create a tunnel
+#   → choose "Cloudflared" → it shows an install command containing
+#   `... run --token eyJ...`. Paste ONLY that token string below.
+#
+# In the tunnel's "Public Hostnames" tab, add three routes (Service is the
+# in-container address — cloudflared resolves these on the Podman network):
+#   app.<your-domain>   → HTTP  → api:8080
+#   auth.<your-domain>  → HTTP  → keycloak:8080
+#   mail.<your-domain>  → HTTP  → mailpit:8025
+TUNNEL_TOKEN=
+
+
+# ── Secrets — CHANGE EVERY VALUE IN THIS SECTION ──────────────────────────
+# SQL Server SA password. SQL Server enforces complexity: 8+ characters and at
+# least three of {uppercase, lowercase, digit, symbol}. The container refuses
+# to start if this is weak.
+SA_PASSWORD=Ch4nge_this_SA_password!
+
+# Keycloak bootstrap admin account. On a public deploy the Keycloak admin
+# console is reachable at AUTH_PUBLIC_URL/admin, so do NOT ship admin/admin.
+KC_ADMIN_USER=admin
+KC_ADMIN_PASSWORD=Ch4nge_this_admin_password!
+
+# Keycloak client secrets. These MUST match the values baked into the realm
+# export (src/AppointMe.Aspire/appointme-realm.json). The defaults below are
+# the realm's committed *local-development* secrets — safe for a sandbox, but
+# rotate them (in BOTH this file and the realm) for anything you actually care
+# about.
+KC_API_CLIENT_SECRET=X3RcYV9FL3FSDvHh5dBYNURvxdZzawii
+KC_FRONTEND_CLIENT_SECRET=d7BP1AYRxH9Ku2yGQ99AzBApfbxyJhVB
+
+
+# ── Behaviour ─────────────────────────────────────────────────────────────
+# Seed ~100 demo customers and their appointments the first time a company is
+# created. Handy for a sandbox; set to false for an empty instance.
+SEED_DEMO_DATA=true
+
 
 
 ================================================================================
@@ -50492,7 +51353,7 @@ npx license-checker-rseidelsohn --summary
 
 
 ===============================================================================
-EXPORT COMPLETED: 06/11/2026 16:13:07
-Total Files Exported: 780
+EXPORT COMPLETED: 06/11/2026 17:10:15
+Total Files Exported: 784
 Output File: D:\DEV\personal\appointme\docs\llm\dump.txt
 ===============================================================================

@@ -1,9 +1,9 @@
 <Project>
 
   <PropertyGroup>
-    <Company>BravoDev</Company>
-    <Authors>BravoDev</Authors>
-    <RepositoryUrl>https://github.com/bravodev/appointme.git</RepositoryUrl>
+    <Company>collabskus</Company>
+    <Authors>kushal</Authors>
+    <RepositoryUrl>https://github.com/collabskus/appointme.git</RepositoryUrl>
     <RepositoryType>Git</RepositoryType>
     <TargetFramework>net10.0</TargetFramework>
     <LangVersion>14</LangVersion>

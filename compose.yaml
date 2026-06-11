@@ -1,83 +1,179 @@
-# Docker Compose for AppointMe's local backing services.
+# ─────────────────────────────────────────────────────────────────────────
+# AppointMe — full single-host deployment for Podman + podman-compose.
 #
-# This starts the SAME dependencies the .NET Aspire host (src/AppointMe.Aspire)
-# brings up — SQL Server, Keycloak, and Mailpit — on the SAME ports and with the
-# SAME credentials. Use it when you'd rather run the API and frontend yourself
-# instead of having Aspire orchestrate everything. See the README "Quick start".
+# Unlike the repo-root compose.yaml (which starts ONLY the backing services for
+# local development), this file runs the ENTIRE application in containers — the
+# API (which also serves the built React SPA), SQL Server, Keycloak, Mailpit —
+# plus a Cloudflare Tunnel that publishes it on the internet over HTTPS.
 #
-# Unlike Aspire, Compose runs ONLY the dependencies. You start the API and the
-# frontend yourself:
-#   dotnet run --project src/AppointMe.Api      # API on https://localhost:7233
-#   cd src/AppointMe.Frontend && yarn dev        # frontend on https://localhost:5173
+# Bring everything up with a single command:
+#     cp .env.example .env        # then edit .env
+#     podman-compose --env-file .env up -d --build
 #
-# One-time setup before the first `docker compose up`: export the trusted
-# ASP.NET Core HTTPS dev certificate that Keycloak serves on https://localhost:8082
-# (so both the API and your browser trust it — exactly what Aspire does for you):
+# Tear it down with:
+#     podman-compose --env-file .env down            # keep data
+#     podman-compose --env-file .env down -v         # wipe data too
 #
-#   dotnet dev-certs https --trust
-#   dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
-#
-# That writes docker/keycloak/certs/keycloak.crt and keycloak.key (git-ignored).
-
+# SELinux: there are deliberately NO bind mounts here. Config that other stacks
+# would bind-mount (the Keycloak realm, the config script) is baked into the
+# custom Keycloak image instead, so there is nothing to relabel with :z/:Z. The
+# only volumes are *named* volumes, which Podman labels for SELinux on its own.
+# The `:U` you see on the two data volumes is a separate thing — it fixes file
+# OWNERSHIP, not SELinux labels (see the comments on those volumes).
+# ─────────────────────────────────────────────────────────────────────────
 name: appointme
 
 services:
+
+  # ── Database ──────────────────────────────────────────────────────────
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2025-CU1-ubuntu-24.04
-    container_name: appointme-sql
     environment:
       ACCEPT_EULA: "Y"
-      MSSQL_SA_PASSWORD: "Password1"
-    ports:
-      - "60740:1433"
+      MSSQL_SA_PASSWORD: "${SA_PASSWORD}"
+      MSSQL_PID: "Developer"
     volumes:
-      - sqlserver-data:/var/opt/mssql
+      # ":U" tells Podman to chown the volume to the UID the SQL Server process
+      # runs as inside the container (mssql, uid 10001). Without it, a *rootless*
+      # Podman run leaves the volume owned by a UID the container can't write to,
+      # and SQL Server dies on boot with an "Anonymous errorlog" / permission
+      # error. ":U" makes the same compose file work rootful AND rootless.
+      - sqlserver-data:/var/opt/mssql:U
     healthcheck:
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q \"SELECT 1\" -b -o /dev/null"]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 20s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
 
-  keycloak:
-    image: quay.io/keycloak/keycloak:26.6
-    container_name: appointme-keycloak
-    command: ["start-dev", "--import-realm"]
-    environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
-      KC_HEALTH_ENABLED: "true"
-      KC_HTTPS_PORT: "8443"
-      KC_HTTPS_CERTIFICATE_FILE: /opt/keycloak/certs/keycloak.crt
-      KC_HTTPS_CERTIFICATE_KEY_FILE: /opt/keycloak/certs/keycloak.key
-    ports:
-      - "8082:8443"
-    volumes:
-      - keycloak-data:/opt/keycloak/data
-      - ./src/AppointMe.Aspire/appointme-realm.json:/opt/keycloak/data/import/appointme-realm.json:ro
-      - ./docker/keycloak/certs/keycloak.crt:/opt/keycloak/certs/keycloak.crt:ro
-      - ./docker/keycloak/certs/keycloak.key:/opt/keycloak/certs/keycloak.key:ro
-    healthcheck:
-      # The image ships no curl/wget, so probe the HTTPS port with bash's /dev/tcp.
-      # The port only accepts connections once the realm import has finished.
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8443"]
-      interval: 10s
-      timeout: 5s
-      retries: 15
-      start_period: 20s
-
+  # ── Mail catcher ──────────────────────────────────────────────────────
+  # Sign-up sends a "verify your email & set your password" link. Without
+  # somewhere for that mail to land, a brand-new account can never set a
+  # password and can never log in. Mailpit catches it; publish mail.<domain>
+  # → mailpit:8025 in the tunnel so you can click the link.
   mailpit:
-    image: axllent/mailpit
-    container_name: appointme-mailpit
+    image: docker.io/axllent/mailpit
     networks:
       default:
-        # The imported realm sends SMTP to host "Mailpit" (appointme-realm.json
-        # -> smtpServer.host), so expose that name on the Compose network.
         aliases:
+          # The realm's SMTP server host is literally "Mailpit", so expose that
+          # name on the network for Keycloak to find.
           - Mailpit
-    ports:
-      - "8026:8025"   # web UI  -> http://localhost:8026
-      - "1026:1025"   # SMTP
+    restart: unless-stopped
+
+  # ── Identity provider ─────────────────────────────────────────────────
+  keycloak:
+    build:
+      context: ..
+      dockerfile: deploy/keycloak/Containerfile
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: "${KC_ADMIN_USER}"
+      KC_BOOTSTRAP_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD}"
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_ENABLED: "true"
+      # The tunnel terminates TLS at Cloudflare and forwards plain HTTP to us,
+      # setting X-Forwarded-Proto/Host. Trusting those headers is what lets
+      # Keycloak know it is "really" being reached over HTTPS at the public URL.
+      KC_PROXY_HEADERS: "xforwarded"
+      # The public origin Keycloak should put in issued tokens (the `iss` claim)
+      # and in the login redirect. MUST match what the browser actually hits.
+      KC_HOSTNAME: "${AUTH_PUBLIC_URL}"
+      KC_HOSTNAME_STRICT: "false"
+    volumes:
+      # start-dev keeps its realm/users in an H2 file under data/; persist it so
+      # accounts survive restarts. ":U" for the same rootless-ownership reason
+      # as SQL Server above.
+      - keycloak-data:/opt/keycloak/data:U
+    healthcheck:
+      # The image ships no curl/wget; bash's /dev/tcp probes the management port,
+      # which opens once Keycloak has started.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── One-shot: allow-list the public URL on the Keycloak clients ────────
+  # Runs the script baked into the Keycloak image, then exits. It self-waits
+  # for Keycloak, so exact start ordering doesn't matter.
+  keycloak-config:
+    build:
+      context: ..
+      dockerfile: deploy/keycloak/Containerfile
+    entrypoint: ["/bin/bash", "/opt/appointme/configure-clients.sh"]
+    environment:
+      KC_ADMIN_USER: "${KC_ADMIN_USER}"
+      KC_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD}"
+      APP_PUBLIC_URL: "${APP_PUBLIC_URL}"
+    depends_on:
+      - keycloak
+    restart: "no"
+
+  # ── The application (API + bundled React SPA) ─────────────────────────
+  api:
+    build:
+      # The Dockerfile does `COPY . .` and builds the frontend from src/, so the
+      # build context is the repo root, not src/AppointMe.Api. (Podman reads a
+      # file named Dockerfile or Containerfile interchangeably.)
+      context: ..
+      dockerfile: src/AppointMe.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:8080"
+
+      # Database — internal service name, not localhost.
+      ConnectionStrings__AppointMeSql: "Server=sqlserver,1433;Database=AppointMe;User ID=sa;Password=${SA_PASSWORD};TrustServerCertificate=True;Encrypt=False"
+
+      # Where the API sends the browser back to after login, and where the
+      # password-setup email link points. This is the app's own public origin.
+      Frontend__BaseUrl: "${APP_PUBLIC_URL}"
+
+      # OIDC. Authority is browser-facing (the browser is redirected there), so
+      # it must be the PUBLIC Keycloak URL and must serve HTTPS — hence
+      # RequireHttpsMetadata=true.
+      Authentication__Provider: "Keycloak"
+      Authentication__RequireHttpsMetadata: "true"
+      Authentication__Keycloak__Authority: "${AUTH_PUBLIC_URL}/realms/appointme"
+      Authentication__Keycloak__FrontendClientId: "appointme-frontend"
+      Authentication__Keycloak__FrontendClientSecret: "${KC_FRONTEND_CLIENT_SECRET}"
+      Authentication__Keycloak__ApiAudience: "appointme-api"
+
+      # Admin API for provisioning users at sign-up. This is a back-channel call
+      # (server → Keycloak), so it can — and should — use the fast internal URL.
+      KeycloakAdmin__BaseUrl: "http://keycloak:8080"
+      KeycloakAdmin__Realm: "appointme"
+      KeycloakAdmin__ClientId: "appointme-api"
+      KeycloakAdmin__ClientSecret: "${KC_API_CLIENT_SECRET}"
+
+      # Durable messaging on top of SQL Server (no external broker needed).
+      Wolverine__Transport: "SqlDurable"
+
+      Demo__Enabled: "${SEED_DEMO_DATA}"
+    depends_on:
+      - sqlserver
+      - keycloak
+    # On the very first boot the API may start before SQL Server has finished
+    # initialising; its startup migration step will then fail and the process
+    # exits. `restart: unless-stopped` simply brings it back, and within a
+    # restart or two SQL Server is ready and migrations apply cleanly. This is
+    # intentional: a container should tolerate its dependencies not being up yet.
+    restart: unless-stopped
+
+  # ── Public HTTPS via Cloudflare Tunnel (named tunnel, token auth) ──────
+  # The connector dials OUT to Cloudflare, so the server needs no open inbound
+  # ports and no public IP. Routing (which hostname → which service) is set in
+  # the Cloudflare dashboard; see .env.example.
+  cloudflared:
+    image: docker.io/cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${TUNNEL_TOKEN}"]
+    depends_on:
+      - api
+      - keycloak
+      - mailpit
+    restart: unless-stopped
 
 volumes:
   sqlserver-data:

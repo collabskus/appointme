@@ -1,263 +1,259 @@
 # AppointMe
 
-A personal **learning sandbox** — a multi-tenant appointment-booking app I use to
-explore advanced .NET and React patterns end to end. It's a modular monolith
-(.NET 10 + React 19) with the genuinely hard parts wired up: multi-tenancy,
-hybrid authentication, a permission engine, CQRS with domain events, durable
-messaging, and a typed frontend generated from the backend's OpenAPI contract.
+A multi-tenant **appointment-booking SaaS**, built as a **.NET 10 modular
+monolith** with a **React 19** front end.
 
-## What this is (and isn't)
+This is a **personal learning sandbox**. It is a deliberately over-engineered
+worked example: a place to practise modern back-end architecture — modular
+monoliths, vertical slices, CQRS, domain events, a permission engine,
+fail-closed multi-tenancy — and to write the reasoning down so it teaches.
+It is not a product and comes with no warranty. Treat the code as a reference,
+not as something to run a real business on.
 
-This repo is **public so it's easy to read and learn from**, but it's a personal
-project, not a product or a starter template:
+If you want the architecture explained from first principles — what each pattern
+is, *why* it's used here, and where it's deliberately taken too far — start with
+**[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
 
-- **Not a template.** There's no "clone-and-build-your-startup" intent. It's where
-  I try ideas — some patterns here are deliberately more elaborate than a real
-  product would need, because the point is to learn them.
-- **No support, no roadmap, no contribution process.** Issues and PRs aren't being
-  solicited. Read it, borrow from it, fork it — all fine (it's MIT) — but I'm
-  building it for myself.
-- **It may break or change shape without notice.** `main` is my working branch.
+---
 
-If you landed here looking for production-grade reference patterns, plenty of them
-are here and they work — just treat them as study material, not a supported library.
+## What's in the box
 
-## What's inside
+| Concern        | Choice                                                                 |
+|----------------|------------------------------------------------------------------------|
+| Language       | C# 14 on .NET 10; TypeScript on the front end                          |
+| Web            | ASP.NET Core minimal APIs, versioned with Asp.Versioning               |
+| Messaging      | **WolverineFx 6** (in-process mediator + **SQL-Server durable** transport) |
+| Writes         | EF Core 10 (aggregates)                                                |
+| Reads          | Dapper (hand-written SQL → DTOs)                                        |
+| Background jobs| Hangfire                                                               |
+| Identity       | **Keycloak 26** (OIDC); Microsoft Entra External ID also supported     |
+| Database       | **SQL Server 2025**                                                    |
+| Mail (local)   | Mailpit                                                                |
+| Front end      | React 19, Vite, Tailwind 4, TanStack Query v5, React Hook Form, Zod 4, FullCalendar |
+| API client     | Generated from OpenAPI with **orval**                                  |
+| Local orchestration | **.NET Aspire**                                                   |
+| Observability  | OpenTelemetry                                                          |
 
-- **Modular monolith** — `Identity`, `Organizations`, `CRM`, and `Booking`, each a
-  bounded context with its own `DbContext` and database schema, organized by
-  vertical slice (one folder per use case: command, handler, endpoint, request).
-- **Hybrid authentication** — Keycloak (OIDC) locally, with JWT Bearer for API
-  calls and cookies for browser flows. Sign-up, email verification, and password
-  reset are handled by the app, not by hitting Keycloak directly. An **Entra
-  External ID** path is also wired in as the cloud-identity option.
-- **Multi-tenancy** — company resolved from the `X-Company-Id` header, enforced two
-  ways: EF Core query filters at the data layer (tenant isolation *fails closed* —
-  no company context means no rows), and a handler guard that rejects work with no
-  active company.
-- **CQRS + DDD** — writes go through EF Core aggregates that raise domain events;
-  reads go through Dapper. Async messaging runs on **Wolverine**, which publishes
-  domain events out of the EF change tracker. Locally the transport is a **durable
-  SQL Server queue** (no external broker); **Azure Service Bus** is available as an
-  opt-in transport for cloud.
-- **Permission engine** — permissions are auto-discovered by assembly scanning.
-  Effective permissions are computed from per-role default grants plus per-company
-  overrides, with conflicts arbitrated by a pluggable voting policy
-  (`DenyWins` / `GrantWins`).
-- **Background jobs** — Hangfire runs the recurring reconciliation jobs that keep
-  each module's local projections in sync with the others.
-- **Typed frontend** — React 19 + Vite + Tailwind 4, with TanStack Query hooks and
-  TypeScript types generated directly from the backend OpenAPI spec via **orval**.
-- **One-command local stack** — .NET Aspire orchestrates SQL Server, Keycloak,
-  Mailpit, the API, and the frontend, applying EF migrations and seeding demo data
-  automatically. A matching `compose.yaml` runs the same backing services if you'd
-  rather launch the API and frontend yourself.
+Modules: **Identity**, **Organizations** (companies, roles, permissions),
+**CRM** (customers), **Booking** (services, providers, availability,
+appointments).
 
-## Quick start
+---
 
-Goal: clone the repo and have AppointMe running locally — backend, frontend,
-database, auth, and mail.
+## Run it locally
 
-You choose how the backing services (SQL Server, Keycloak, Mailpit) run:
+You need the .NET 10 SDK, Node.js 22 + Yarn, and a container engine (Docker or
+Podman).
 
-- **Option A — .NET Aspire** *(recommended)*: one command starts everything,
-  including the API and frontend.
-- **Option B — Docker Compose**: brings up only the backing services on the same
-  ports; you run the API and frontend yourself.
+### Option A — Aspire (one process orchestrates everything)
 
-Both produce an identical running app — same images, ports, credentials, and
-seeded data. Do the [prerequisites](#prerequisites) once, then follow either option.
+```bash
+dotnet run --project src/AppointMe.Aspire
+```
+
+Aspire starts SQL Server, Keycloak, and Mailpit, then launches the API and the
+front end already wired together. The Aspire dashboard prints the URLs.
+
+### Option B — Compose for the backing services, app by hand
+
+```bash
+# one-time: trust the ASP.NET dev cert and export it for Keycloak to serve
+dotnet dev-certs https --trust
+dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
+
+docker compose up -d                          # SQL Server, Keycloak, Mailpit
+dotnet run --project src/AppointMe.Api         # API  → https://localhost:7233
+cd src/AppointMe.Frontend && yarn dev          # SPA  → https://localhost:5173
+```
+
+The repo-root `compose.yaml` runs **only the dependencies** — it mirrors what
+Aspire brings up, on the same ports and credentials, for when you'd rather run
+the API and SPA yourself.
+
+> **Sign-up needs the mail catcher.** Creating an account sends a "verify your
+> email and set your password" link. Read it in Mailpit (the Compose setup
+> exposes its web UI on `http://localhost:8026`) and click through to set a
+> password — that's how a new account becomes usable.
+
+---
+
+## Deploy on a Fedora server
+
+This brings up the **entire application in containers** — API (which also serves
+the React SPA), SQL Server, Keycloak, Mailpit — and publishes it on the internet
+over HTTPS through a **Cloudflare Tunnel**, with **one command**. Everything is
+built from `Containerfile`s by Podman; nothing needs to be installed on the host
+except Podman itself.
+
+Files live in [`deploy/`](deploy/).
 
 ### Prerequisites
 
-| Requirement | Why | Notes |
-|---|---|---|
-| [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) | Builds and runs the API and the Aspire host | `dotnet --version` should report `10.x` |
-| [Docker](https://www.docker.com/products/docker-desktop/) (running) | Hosts SQL Server, Keycloak, and Mailpit containers | Docker Desktop or any OCI-compatible runtime |
-| [Node.js 22+](https://nodejs.org/) & [Yarn](https://yarnpkg.com/) | Builds and serves the React frontend | `corepack enable` gives you Yarn |
-| HTTPS dev certificate | Frontend and services run over HTTPS | `dotnet dev-certs https --trust` |
+```bash
+sudo dnf install -y podman podman-compose
+```
 
-> First run pulls container images and restores NuGet/Yarn packages, so it takes a
-> few minutes. Subsequent runs are fast — the SQL Server, Keycloak, and Mailpit
-> containers are persistent and reused across restarts.
+- A domain on a **Cloudflare** account (the free plan is fine). You'll publish
+  the app on three subdomains of it.
+- Roughly **3–4 GB of free RAM** (SQL Server alone wants ~2 GB) and a couple of
+  GB of disk for images and data.
+- An `x86_64` host. (The SQL Server image is x86-only; on ARM you'd swap in Azure
+  SQL Edge.)
 
-### Clone and trust the dev cert
+### 1. Create a Cloudflare named tunnel
 
-Both options start here:
+In the Cloudflare dashboard: **Zero Trust → Networks → Tunnels → Create a
+tunnel → Cloudflared**. Name it, and copy the **token** from the install command
+it shows you (the long `eyJ...` string after `--token`).
+
+Then, on the tunnel's **Public Hostnames** tab, add **three** routes. The
+*Service* is the in-container address — cloudflared resolves these names on the
+Podman network:
+
+| Public hostname        | Type | Service          |
+|------------------------|------|------------------|
+| `app.your-domain.com`  | HTTP | `api:8080`       |
+| `auth.your-domain.com` | HTTP | `keycloak:8080`  |
+| `mail.your-domain.com` | HTTP | `mailpit:8025`   |
+
+### 2. Configure the deployment
 
 ```bash
-git clone https://github.com/collabskus/appointme.git
-cd appointme
-
-# One-time: trust the local HTTPS dev cert (used by the API, frontend, and Keycloak)
-dotnet dev-certs https --trust
+cd deploy
+cp .env.example .env
 ```
 
-### Option A — .NET Aspire
+Edit `.env`:
+
+- `APP_PUBLIC_URL=https://app.your-domain.com`
+- `AUTH_PUBLIC_URL=https://auth.your-domain.com`
+- `TUNNEL_TOKEN=` ← the token from step 1
+- **Change every secret**: `SA_PASSWORD`, `KC_ADMIN_PASSWORD`. (The Keycloak
+  admin console is public at `auth.your-domain.com/admin`, so don't leave
+  `admin/admin`.)
+
+Every variable is documented inline in `.env.example`.
+
+### 3. Bring it up — one command
 
 ```bash
-# Start the whole stack — backing services, API, and frontend
-cd src/AppointMe.Aspire
-dotnet run
+podman-compose --env-file .env up -d --build
 ```
 
-**Prefer an IDE?** Open `AppointMe.sln` in Visual Studio or Rider, set
-**`AppointMe.Aspire`** as the startup project, and press **F5**.
+That's it. Podman builds the SPA and the API from source, builds a self-
+contained Keycloak image (realm baked in), starts the database and mail catcher,
+registers your public URL with Keycloak, and opens the tunnel.
 
-Either way, the [.NET Aspire dashboard](https://learn.microsoft.com/dotnet/aspire/fundamentals/dashboard/overview)
-opens automatically. Wait for every resource to turn **Running** (green) — the API
-waits for SQL Server and Keycloak to be healthy before it starts.
-
-What happens on startup, with no action from you:
-
-- SQL Server, Keycloak, and Mailpit containers come up.
-- The `appointme` Keycloak realm (clients, roles, mappers) is imported.
-- EF Core migrations are applied to every module's schema.
-- Demo customers and appointments are seeded (Development only).
-- The API starts, then the Vite frontend.
-
-### Option B — Docker Compose
-
-Compose runs only the backing services (SQL Server, Keycloak, Mailpit) — on the
-same ports, images, and credentials as Aspire. You run the API and frontend
-yourself.
+The **first** build is slow (it compiles the .NET solution and bundles the
+front end) and, on first boot, the API may restart a couple of times while SQL
+Server finishes initialising — that's expected and self-heals. Watch it settle
+with:
 
 ```bash
-# 1. One-time: export the trusted dev cert that Keycloak serves on https://localhost:8082
-./docker/keycloak/export-dev-cert.sh
-#    (Windows / no bash — run the command the script wraps:)
-#    dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
-
-# 2. Start the backing services and wait for them to report healthy
-docker compose up -d
-docker compose ps          # SQL Server and Keycloak should show "healthy"
-
-# 3. Run the API (applies migrations + seeds demo data on first start)
-dotnet run --project src/AppointMe.Api
-
-# 4. In a second terminal, run the frontend
-cd src/AppointMe.Frontend
-yarn install
-yarn dev
+podman-compose --env-file .env logs -f api
 ```
 
-Then open **https://localhost:5173**. To stop the services, `docker compose stop`
-(keeps data) or `docker compose down` (removes the containers; SQL Server and
-Keycloak data survive in named volumes — add `-v` to wipe them too).
+Open `https://app.your-domain.com`, create an account, read the verification
+email at `https://mail.your-domain.com`, set your password, and log in.
 
-EF Core migrations and demo-data seeding happen when **you** start the API in
-step 3 (same as Aspire — the API does this on startup, not Compose).
-
-### Where everything lives
-
-| Service | URL | Credentials |
-|---|---|---|
-| **Frontend (the app)** | https://localhost:5173 | sign up — see below |
-| Aspire dashboard | shown in the console at startup | — |
-| Keycloak admin console | https://localhost:8082 | `admin` / `admin` |
-| Mailpit (catches all outgoing email) | http://localhost:8026 | — |
-| API OpenAPI document | https://localhost:7233/openapi/v1.json | — |
-| SQL Server | `localhost:60740` | `sa` / `Password1` |
-
-> **About these credentials.** Every secret used in local development — the SQL `sa`
-> password, the Keycloak `admin` account, and the Keycloak client secrets in
-> `appsettings.Development.json` and `appointme-realm.json` — is a throwaway default.
-> It only protects containers running on your machine, and it's committed on purpose
-> so the stack runs with zero setup. These are safe in a public repo, but **never
-> reuse them anywhere real**. Any cloud secrets live in Azure Key Vault and are
-> injected at deploy time (see [`infra/`](./infra)). A `gitleaks` workflow scans
-> every push/PR to catch any *real* secret that slips in.
-
-### Create your first account
-
-The app manages its own sign-up — you don't register through Keycloak directly.
-
-1. Open **https://localhost:5173** and go to **Sign up** (`/auth/signup`).
-2. Submit the form. AppointMe provisions your user in Keycloak and sends a
-   verification email.
-3. Open **Mailpit at http://localhost:8026**, find the verification email, and click
-   the link. (No real mail is sent — Mailpit catches everything locally.)
-4. Log in with your new credentials.
-5. Complete **onboarding** to create your company. You now have a working,
-   multi-tenant AppointMe instance with demo data to explore.
-
-## Project layout
-
-```
-src/
-├── AppointMe.Aspire/        # .NET Aspire orchestrator — the F5 entry point for local dev
-├── AppointMe.Api/           # ASP.NET Core API host (endpoints auto-discovered)
-├── AppointMe.Shared/        # Shared domain abstractions, value objects, infrastructure
-├── Identity/                # Authentication & user provisioning (Keycloak / Entra External ID)
-├── Organizations/           # Companies, employees, invitations, onboarding, permissions
-├── CRM/                     # Customer management
-├── Booking/                 # Appointments, attendees, service providers, scheduling
-└── AppointMe.Frontend/      # React + Vite + TypeScript SPA
-```
-
-The codebase follows Domain-Driven Design with **vertical slice architecture** —
-each use case owns its command, handler, endpoint, and request/response in a single
-folder. For the full architecture guide, conventions, and patterns, see
-[`CLAUDE.md`](./CLAUDE.md).
-
-## Common commands
+Tear down:
 
 ```bash
-# Full stack (recommended) — from src/AppointMe.Aspire
-dotnet run
-
-# Backing services only, without Aspire (see Quick start → Option B)
-docker compose up -d        # start SQL Server, Keycloak, Mailpit
-docker compose ps           # check health
-docker compose down         # stop and remove containers (data volumes persist)
-
-# Backend only
-dotnet build AppointMe.sln
-dotnet run --project src/AppointMe.Api
-
-# Tests (all unit tests — domain rules + the permission engine)
-dotnet test
-dotnet test --filter "FullyQualifiedName~TestName"   # a single test
-
-# Frontend — from src/AppointMe.Frontend
-yarn install
-yarn dev            # dev server on https://localhost:5173
-yarn build          # production build
-yarn lint           # ESLint
-yarn generate:api   # regenerate the typed API client from the backend OpenAPI spec
+podman-compose --env-file .env down        # keep data (named volumes)
+podman-compose --env-file .env down -v     # also wipe the database & Keycloak data
 ```
 
-> When you change the backend contract (endpoints, request/response shapes, routes,
-> or auth attributes), restart the API and run `yarn generate:api` to keep the
-> frontend's typed client in sync. A reachable-but-stale backend silently produces a
-> stale client.
+### Rootful vs rootless
 
-## Tech stack
+The happy path on a dedicated server is **rootful** Podman, which avoids
+user-namespace UID surprises with the database volume:
 
-- **Backend:** .NET 10, C# 14, EF Core 10, Wolverine 6, Dapper, Hangfire, Scrutor
-- **Frontend:** React 19, TypeScript 5, Vite, Tailwind CSS 4, TanStack Query v5,
-  React Hook Form + Zod, FullCalendar, orval (OpenAPI → typed client)
-- **Messaging:** Wolverine on a durable SQL Server transport locally; Azure Service
-  Bus as an opt-in transport
-- **Local stack:** SQL Server 2025, Keycloak, Mailpit — orchestrated with .NET Aspire
-- **Observability:** OpenTelemetry (traces/metrics exported to the Aspire dashboard)
+```bash
+sudo podman-compose --env-file .env up -d --build
+```
 
-## CI & deployment
+The compose file is also written to work **rootless** — the `:U` flag on the two
+data volumes (see below) chowns them to the right in-container user so SQL Server
+and Keycloak can write to them. If you hit a database permission error rootless,
+that flag is the fix; rerunning rootful is the quick escape hatch.
 
-The repo includes more pipeline than a sandbox strictly needs, kept as a working
-reference:
+### A note on SELinux and `:z` / `:Z` (Fedora)
 
-- **`secret-scan`** — gitleaks on every push/PR. Useful regardless of deployment.
-- **`devtest`** — build, test, and frontend lint/build on every push/PR, followed by
-  jobs that build a container image, push it to Azure Container Registry, and deploy
-  to Azure App Service. **Those deploy jobs require Azure secrets and live
-  infrastructure** ([`infra/`](./infra) provisions it via Bicep); without them, only
-  the build-and-test stage is meaningful. If you fork this, expect the deploy jobs to
-  be red until you supply your own Azure setup (or disable them).
+On Fedora, SELinux stops a container from reading host files through a bind mount
+unless the mount is relabelled:
+
+- **`:z`** — relabel the content as **shared** (multiple containers may use it).
+- **`:Z`** — relabel as **private** to a single container. More secure; use it
+  unless two containers genuinely share the path.
+
+```yaml
+volumes:
+  - ./some/host/dir:/in/container:Z      # private to this container
+```
+
+**This deployment has no bind mounts**, so there is nothing to relabel — the
+realm export and the config script are baked into the Keycloak image instead, and
+all persistent data lives in **named volumes** (which Podman labels for SELinux
+automatically). If you later add a bind mount (say, a `cloudflared` config file),
+add `:Z` to it. The `:U` you'll see on the data volumes is unrelated to SELinux —
+it fixes file **ownership**, not the security label.
+
+### Why a *named* tunnel — and not `try cloudflare` (the random URL)
+
+The quick `cloudflared tunnel --url http://api:8080` command hands you a fresh
+random `https://something.trycloudflare.com` address each run, with no account
+and no domain. It's great for showing a colleague a static site in ten seconds.
+
+**It cannot carry this app's login**, and the reason is worth understanding,
+because it's a property of OIDC, not a Cloudflare limitation:
+
+1. **The login is a browser redirect.** Logging in sends the browser *to
+   Keycloak* and back. So Keycloak itself has to be reachable at a public URL the
+   browser can hit — but a quick tunnel gives you exactly **one** URL, pointed at
+   one service. You can't reach both the app and Keycloak through it.
+2. **OIDC pins itself to a known hostname.** Every token Keycloak issues stamps
+   the issuer (`iss`) with its public hostname, and the API rejects tokens whose
+   issuer doesn't match what it was configured to trust. A hostname that's
+   different on every boot can't be configured ahead of time.
+3. **Redirect URIs are allow-listed.** Keycloak only redirects back to URLs a
+   client has pre-registered (that check is what stops an attacker stealing your
+   authorization code). You can't pre-register a hostname you won't know until
+   the tunnel is already running.
+
+In short, **interactive OIDC login needs a stable, known-in-advance hostname**,
+and a named tunnel gives you exactly that for free. (You *could* make the random
+URL work by discovering it at boot and rewriting Keycloak's hostname, the API's
+authority, and the clients' redirect URIs on every start — but that's a pile of
+fragile glue that teaches a pattern you should never ship. The honest answer is:
+use a named tunnel. It's the same `cloudflared`, same free plan, one extra DNS
+record.)
+
+You *can* still point a quick tunnel at `api:8080` to confirm the tunnel works
+and watch the login page render — just expect the login round-trip itself to
+fail until you move to a named tunnel.
+
+### Tempted to switch login to a username/password POST instead?
+
+It would make the random-URL problem vanish (the browser would only ever talk to
+the app). Don't. That's OAuth's **Resource Owner Password Credentials** /
+"direct grant" flow — deprecated in OAuth 2.1, and it throws away SSO, MFA,
+social login, and the principle that your app never handles the user's IdP
+password. It's a textbook example of a shortcut that's an anti-pattern;
+`docs/ARCHITECTURE.md` walks through why.
+
+---
+
+## Continuous integration
+
+GitHub Actions builds and unit-tests the solution on push. Note the workflow also
+contains **publish-image** and **deploy-to-Azure** jobs gated on `main`; those
+require Azure secrets and federated credentials to be configured in the repo, and
+will fail on a fork without them. If you fork this to experiment, either add those
+secrets or gate/remove those jobs — they're independent of the Podman deployment
+above.
+
+---
 
 ## License
 
-Released under the [MIT License](./LICENSE) — free to use, modify, and distribute,
-including commercially. It builds on open-source libraries that remain under their
-own licenses; see [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md) for
-attribution and a note on Hangfire (LGPL-3.0).
+MIT. See [`LICENSE`](LICENSE).

@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────
+# A self-contained Keycloak image for AppointMe.
+#
+# It is just upstream Keycloak plus two files baked in:
+#   1. the realm export  → imported automatically on first start
+#   2. the post-import client-configuration script (run by a one-shot sidecar)
+#
+# WHY bake them in instead of bind-mounting from the host?
+# On Fedora, SELinux blocks a container from reading host files unless the
+# mount carries a relabel option (:z for shared, :Z for private). Baking the
+# files into the image means there are NO bind mounts in the whole stack, so
+# there is nothing to relabel — the SELinux :z/:Z question simply never comes
+# up for the core services. (The README explains :z/:Z anyway, for the day you
+# DO add a bind mount.)
+#
+# Build context is the REPOSITORY ROOT (see deploy/compose.yaml), which is why
+# the COPY paths below start from the repo root.
+# ─────────────────────────────────────────────────────────────────────────
+FROM quay.io/keycloak/keycloak:26.6
+
+# Keycloak imports every realm file under this directory when started with
+# `--import-realm`. Import is a no-op once the realm already exists in the DB,
+# so this is safe on every boot.
+COPY src/AppointMe.Aspire/appointme-realm.json /opt/keycloak/data/import/appointme-realm.json
+
+# Runs once after Keycloak is up to allow-list this deployment's public URL as
+# an OIDC redirect target (the realm only ships localhost URLs). See
+# deploy/compose.yaml → the `keycloak-config` service.
+COPY deploy/keycloak/configure-clients.sh /opt/appointme/configure-clients.sh
