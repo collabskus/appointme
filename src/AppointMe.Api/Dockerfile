@@ -1,8 +1,13 @@
-# syntax=docker/dockerfile:1.7
 # Build context is the repo root, not src/AppointMe.Api.
+#
+# Plain multi-stage Dockerfile syntax — builds identically under Podman/Buildah
+# (rootful or rootless) and Docker/BuildKit. All base images are fully
+# qualified: Podman on Fedora enforces short-name resolution, and an
+# unqualified name like `node:22-alpine` can fail or prompt in a
+# non-interactive `podman-compose build`.
 
 # Stage 1: frontend bundle
-FROM node:22-alpine AS frontend
+FROM docker.io/library/node:22-alpine AS frontend
 WORKDIR /src
 COPY src/AppointMe.Frontend/package.json src/AppointMe.Frontend/yarn.lock ./
 RUN yarn install --frozen-lockfile

@@ -39,8 +39,10 @@ public static class HangfireExtensions
         {
             app.UseHangfireDashboard("/admin/jobs", new DashboardOptions
             {
-                // No auth for now. Default would apply LocalRequestsOnlyAuthorizationFilter.
-                Authorization = [],
+                // Authenticated users only. The default (local requests only)
+                // is useless behind the tunnel, and an empty list would expose
+                // the dashboard publicly in the Podman deployment.
+                Authorization = [new AuthenticatedUserDashboardFilter()],
             });
             return app;
         }

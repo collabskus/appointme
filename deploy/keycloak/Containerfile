@@ -23,7 +23,8 @@ FROM quay.io/keycloak/keycloak:26.6
 # so this is safe on every boot.
 COPY src/AppointMe.Aspire/appointme-realm.json /opt/keycloak/data/import/appointme-realm.json
 
-# Runs once after Keycloak is up to allow-list this deployment's public URL as
-# an OIDC redirect target (the realm only ships localhost URLs). See
-# deploy/compose.yaml → the `keycloak-config` service.
+# Runs once after Keycloak is up to configure this deployment's clients —
+# allow-listing the public URL as an OIDC redirect target and setting the API
+# client secret from the environment. See deploy/compose.yaml → the
+# `keycloak-config` service.
 COPY deploy/keycloak/configure-clients.sh /opt/appointme/configure-clients.sh

@@ -1,0 +1,214 @@
+# ─────────────────────────────────────────────────────────────────────────
+# AppointMe — full single-host deployment for Podman + podman-compose.
+#
+# Unlike the repo-root compose.yaml (which starts ONLY the backing services for
+# local development), this file runs the ENTIRE application in containers — the
+# API (which also serves the built React SPA), SQL Server, Keycloak, Mailpit —
+# plus a Cloudflare Tunnel that publishes it on the internet over HTTPS.
+#
+# Run it from THIS directory (deploy/) — the build contexts below are `..`,
+# the repository root, because the API image compiles the whole solution and
+# the Keycloak image bakes in files from src/.
+#
+# Bring everything up with a single command:
+#     cp .env.example .env        # then edit .env
+#     podman-compose --env-file .env up -d --build
+#
+# Tear it down with:
+#     podman-compose --env-file .env down            # keep data
+#     podman-compose --env-file .env down -v         # wipe data too
+#
+# SELinux: there are deliberately NO bind mounts here. Config that other stacks
+# would bind-mount (the Keycloak realm, the config script) is baked into the
+# custom Keycloak image instead, so there is nothing to relabel with :z/:Z. The
+# only volumes are *named* volumes, which Podman labels for SELinux on its own.
+# The `:U` you see on the data volumes is a separate thing — it fixes file
+# OWNERSHIP, not SELinux labels (see the comments on those volumes).
+#
+# Restart policy: every long-running service uses `restart: always` (not
+# `unless-stopped`) because Podman's boot-time restart unit only picks up
+# containers whose policy is exactly "always":
+#     sudo systemctl enable --now podman-restart.service     # rootful
+# Rootless instead needs the user unit plus lingering:
+#     systemctl --user enable --now podman-restart.service
+#     loginctl enable-linger $USER
+# Without one of those, a host reboot leaves the stack down. During a session,
+# "always" behaves the way you'd want: `podman-compose down` / `podman stop`
+# still keep a container down — the policy only fires when a container *exits*,
+# not when you stop it.
+# ─────────────────────────────────────────────────────────────────────────
+name: appointme
+
+services:
+
+  # ── Database ──────────────────────────────────────────────────────────
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2025-CU1-ubuntu-24.04
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${SA_PASSWORD}"
+      MSSQL_PID: "Developer"
+    volumes:
+      # ":U" tells Podman to chown the volume to the UID the SQL Server process
+      # runs as inside the container (mssql, uid 10001). Without it, a *rootless*
+      # Podman run leaves the volume owned by a UID the container can't write to,
+      # and SQL Server dies on boot with an "Anonymous errorlog" / permission
+      # error. ":U" makes the same compose file work rootful AND rootless.
+      - sqlserver-data:/var/opt/mssql:U
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q \"SELECT 1\" -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: always
+
+  # ── Mail catcher ──────────────────────────────────────────────────────
+  # Sign-up sends a "verify your email & set your password" link. Without
+  # somewhere for that mail to land, a brand-new account can never set a
+  # password and can never log in. Mailpit catches it; publish mail.<domain>
+  # → mailpit:8025 in the tunnel so you can click the link.
+  mailpit:
+    image: docker.io/axllent/mailpit:latest
+    networks:
+      default:
+        aliases:
+          # The realm's SMTP server host is literally "Mailpit", so expose that
+          # name on the network for Keycloak to find. (DNS is case-insensitive,
+          # so the alias and the service name coexist happily.)
+          - Mailpit
+    restart: always
+
+  # ── Identity provider ─────────────────────────────────────────────────
+  keycloak:
+    build:
+      context: ..
+      dockerfile: deploy/keycloak/Containerfile
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: "${KC_ADMIN_USER}"
+      KC_BOOTSTRAP_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD}"
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_ENABLED: "true"
+      # The tunnel terminates TLS at Cloudflare and forwards plain HTTP to us,
+      # setting X-Forwarded-Proto/Host. Trusting those headers is what lets
+      # Keycloak know it is "really" being reached over HTTPS at the public URL.
+      KC_PROXY_HEADERS: "xforwarded"
+      # The public origin Keycloak should put in issued tokens (the `iss` claim)
+      # and in the login redirect. MUST match what the browser actually hits.
+      KC_HOSTNAME: "${AUTH_PUBLIC_URL}"
+      KC_HOSTNAME_STRICT: "false"
+    volumes:
+      # start-dev keeps its realm/users in an H2 file under data/; persist it so
+      # accounts survive restarts. ":U" for the same rootless-ownership reason
+      # as SQL Server above.
+      - keycloak-data:/opt/keycloak/data:U
+    healthcheck:
+      # The image ships no curl/wget; bash's /dev/tcp probes the management port,
+      # which opens once Keycloak has started. (A bare TCP connect, so it works
+      # whether the management interface is serving HTTP or HTTPS.)
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: always
+
+  # ── One-shot: configure the Keycloak clients for this deployment ───────
+  # Runs the script baked into the Keycloak image, then exits. It self-waits
+  # for Keycloak, so exact start ordering doesn't matter. It (1) allow-lists
+  # the public URL as an OIDC redirect target on both clients, and (2) sets the
+  # appointme-api client secret to KC_API_CLIENT_SECRET, so the secret in .env
+  # is authoritative — you can rotate it without editing the realm export.
+  keycloak-config:
+    build:
+      context: ..
+      dockerfile: deploy/keycloak/Containerfile
+    entrypoint: ["/bin/bash", "/opt/appointme/configure-clients.sh"]
+    environment:
+      KC_ADMIN_USER: "${KC_ADMIN_USER}"
+      KC_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD}"
+      APP_PUBLIC_URL: "${APP_PUBLIC_URL}"
+      KC_API_CLIENT_SECRET: "${KC_API_CLIENT_SECRET}"
+    depends_on:
+      - keycloak
+    restart: "no"
+
+  # ── The application (API + bundled React SPA) ─────────────────────────
+  api:
+    build:
+      # The Dockerfile does `COPY . .` and builds the frontend from src/, so the
+      # build context is the repo root, not src/AppointMe.Api. (Podman reads a
+      # file named Dockerfile or Containerfile interchangeably.)
+      context: ..
+      dockerfile: src/AppointMe.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:8080"
+
+      # Database — internal service name, not localhost.
+      ConnectionStrings__AppointMeSql: "Server=sqlserver,1433;Database=AppointMe;User ID=sa;Password=${SA_PASSWORD};TrustServerCertificate=True;Encrypt=False"
+
+      # Where the API sends the browser back to after login, and where the
+      # password-setup email link points. This is the app's own public origin.
+      Frontend__BaseUrl: "${APP_PUBLIC_URL}"
+
+      # OIDC. Authority is browser-facing (the browser is redirected there), so
+      # it must be the PUBLIC Keycloak URL and must serve HTTPS — hence
+      # RequireHttpsMetadata=true.
+      Authentication__Provider: "Keycloak"
+      Authentication__RequireHttpsMetadata: "true"
+      Authentication__Keycloak__Authority: "${AUTH_PUBLIC_URL}/realms/appointme"
+      Authentication__Keycloak__FrontendClientId: "appointme-frontend"
+      Authentication__Keycloak__FrontendClientSecret: "${KC_FRONTEND_CLIENT_SECRET}"
+      Authentication__Keycloak__ApiAudience: "appointme-api"
+
+      # Admin API for provisioning users at sign-up. This is a back-channel call
+      # (server → Keycloak), so it can — and should — use the fast internal URL.
+      KeycloakAdmin__BaseUrl: "http://keycloak:8080"
+      KeycloakAdmin__Realm: "appointme"
+      KeycloakAdmin__ClientId: "appointme-api"
+      KeycloakAdmin__ClientSecret: "${KC_API_CLIENT_SECRET}"
+
+      # Durable messaging on top of SQL Server (no external broker needed).
+      Wolverine__Transport: "SqlDurable"
+
+      Demo__Enabled: "${SEED_DEMO_DATA}"
+    volumes:
+      # ASP.NET Data Protection keys. These encrypt the auth cookie and the
+      # OIDC state/correlation cookies. Without persistence, every image
+      # rebuild or container re-creation rotates the keys — which silently
+      # logs every user out and makes any login that is mid-flight fail with
+      # a correlation error. A tiny named volume fixes that. ":U" because the
+      # app runs as the non-root `app` user (uid 1654) and must own the dir.
+      # (Keys are stored unencrypted at rest — fine for this sandbox; point
+      # ConnectionStrings__DataProtectionStorage at Azure Blob if you need
+      # encrypted, shared key storage.)
+      - dp-keys:/home/app/.aspnet/DataProtection-Keys:U
+    depends_on:
+      - sqlserver
+      - keycloak
+    # On the very first boot the API may start before SQL Server has finished
+    # initialising; its startup migration step will then fail and the process
+    # exits. The restart policy simply brings it back, and within a restart or
+    # two SQL Server is ready and migrations apply cleanly. This is
+    # intentional: a container should tolerate its dependencies not being up yet.
+    restart: always
+
+  # ── Public HTTPS via Cloudflare Tunnel (named tunnel, token auth) ──────
+  # The connector dials OUT to Cloudflare, so the server needs no open inbound
+  # ports and no public IP. Routing (which hostname → which service) is set in
+  # the Cloudflare dashboard; see .env.example.
+  cloudflared:
+    image: docker.io/cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${TUNNEL_TOKEN}"]
+    depends_on:
+      - api
+      - keycloak
+      - mailpit
+    restart: always
+
+volumes:
+  sqlserver-data:
+  keycloak-data:
+  dp-keys:

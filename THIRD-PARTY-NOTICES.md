@@ -73,3 +73,11 @@ dotnet-project-licenses --input AppointMe.sln --output-format markdown
 cd src/AppointMe.Frontend
 npx license-checker-rseidelsohn --summary
 ```
+
+
+
+===============================================================================
+EXPORT COMPLETED: 06/11/2026 17:10:15
+Total Files Exported: 784
+Output File: D:\DEV\personal\appointme\docs\llm\dump.txt
+===============================================================================

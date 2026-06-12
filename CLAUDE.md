@@ -112,10 +112,10 @@ Or run the backing services with Compose and the app yourself:
 
 ```bash
 # one-time: trust the dev cert Keycloak serves, and export it for the container
-dotnet dev-certs https --trust
-dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
+# (the script also fixes the key's permissions for rootless Podman)
+bash docker/keycloak/export-dev-cert.sh
 
-docker compose up -d                                  # SQL Server, Keycloak, Mailpit
+podman compose up -d                                  # SQL Server, Keycloak, Mailpit
 dotnet run --project src/AppointMe.Api                # API  → https://localhost:7233
 cd src/AppointMe.Frontend && yarn dev                 # SPA  → https://localhost:5173
 ```

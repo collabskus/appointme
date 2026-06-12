@@ -12,7 +12,7 @@ not as something to run a real business on.
 
 If you want the architecture explained from first principles — what each pattern
 is, *why* it's used here, and where it's deliberately taken too far — start with
-**[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
+**[`ARCHITECTURE.md`](ARCHITECTURE.md)**.
 
 ---
 
@@ -58,13 +58,16 @@ front end already wired together. The Aspire dashboard prints the URLs.
 
 ```bash
 # one-time: trust the ASP.NET dev cert and export it for Keycloak to serve
-dotnet dev-certs https --trust
-dotnet dev-certs https --format PEM --no-password -ep docker/keycloak/certs/keycloak.crt
+bash docker/keycloak/export-dev-cert.sh
 
-docker compose up -d                          # SQL Server, Keycloak, Mailpit
+podman compose up -d                           # SQL Server, Keycloak, Mailpit
 dotnet run --project src/AppointMe.Api         # API  → https://localhost:7233
 cd src/AppointMe.Frontend && yarn dev          # SPA  → https://localhost:5173
 ```
+
+(`docker compose up -d` and `podman-compose up -d` work identically — the file
+is engine-agnostic. On Fedora, the two bind mounts it uses carry `:Z` SELinux
+labels, so no extra setup is needed.)
 
 The repo-root `compose.yaml` runs **only the dependencies** — it mirrors what
 Aspire brings up, on the same ports and credentials, for when you'd rather run
@@ -162,6 +165,32 @@ Tear down:
 podman-compose --env-file .env down        # keep data (named volumes)
 podman-compose --env-file .env down -v     # also wipe the database & Keycloak data
 ```
+
+> **The job dashboard requires login.** Hangfire's dashboard at
+> `APP_PUBLIC_URL/admin/jobs` is reachable through the tunnel, so it requires
+> an authenticated user — log in to the app first, then open it.
+
+### Surviving a reboot
+
+Podman has no daemon, so a `restart:` policy alone doesn't bring containers
+back after the host reboots — a small systemd unit does that, and it only picks
+up containers whose policy is exactly `always` (which is what
+`deploy/compose.yaml` uses). Enable it once:
+
+```bash
+# rootful (matches the sudo workflow above)
+sudo systemctl enable --now podman-restart.service
+
+# rootless instead needs the user unit, plus lingering so it runs at boot
+systemctl --user enable --now podman-restart.service
+loginctl enable-linger $USER
+```
+
+During a session the policy behaves the way you'd expect: `podman-compose
+down` or `podman stop` keeps a container down — the policy only fires when a
+container *exits*, not when you stop it. (For a longer-lived server you'd
+graduate to [Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html)
+units; for this sandbox, `podman-restart.service` is enough.)
 
 ### Rootful vs rootless
 

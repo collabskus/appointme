@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────
-# Register this deployment's public URL as a valid OIDC redirect target.
+# Configure the realm's OIDC clients for this deployment.
 #
 # THE PROBLEM THIS SOLVES
 # Keycloak refuses any `redirect_uri` that a client hasn't explicitly allow-
@@ -17,7 +17,12 @@
 #   • appointme-api      → used as the client for the "verify email / set
 #       password" link, whose redirect lands on APP_PUBLIC_URL/auth/login
 #
-# This script is idempotent: it SETS the full desired list every time, so
+# It ALSO sets the appointme-api client secret to $KC_API_CLIENT_SECRET (when
+# provided), so the value in deploy/.env is authoritative and can be rotated
+# without ever editing the realm export. (appointme-frontend is a PUBLIC
+# client — it has no secret to set.)
+#
+# This script is idempotent: it SETS the full desired state every time, so
 # re-running it (every `up`) just reasserts the same state.
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -25,6 +30,9 @@ set -euo pipefail
 KCADM=/opt/keycloak/bin/kcadm.sh
 SERVER=http://keycloak:8080      # internal address on the Podman network
 REALM=appointme
+
+# Optional: when set, applied as the appointme-api client secret.
+KC_API_CLIENT_SECRET="${KC_API_CLIENT_SECRET:-}"
 
 echo "keycloak-config: waiting for Keycloak to accept admin logins..."
 # Keycloak takes a little while to import the realm and open its admin API.
@@ -36,11 +44,16 @@ until "$KCADM" config credentials \
 done
 echo "keycloak-config: connected."
 
-configure_client() {
+# Look up a client's internal UUID by its clientId. Prints nothing if absent.
+client_uuid() {
+  "$KCADM" get clients -r "$REALM" -q "clientId=$1" \
+      --fields id --format csv --noquotes | tr -d '\r\n'
+}
+
+configure_redirects() {
   local client_id="$1"
   local uuid
-  uuid="$("$KCADM" get clients -r "$REALM" -q "clientId=$client_id" \
-            --fields id --format csv --noquotes | tr -d '\r\n')"
+  uuid="$(client_uuid "$client_id")"
 
   if [ -z "$uuid" ]; then
     echo "keycloak-config: WARNING — client '$client_id' not found, skipping."
@@ -54,7 +67,28 @@ configure_client() {
   echo "keycloak-config: '$client_id' now accepts redirects to ${APP_PUBLIC_URL}"
 }
 
-configure_client appointme-frontend
-configure_client appointme-api
+set_api_client_secret() {
+  local client_id="appointme-api"
+
+  if [ -z "$KC_API_CLIENT_SECRET" ]; then
+    echo "keycloak-config: KC_API_CLIENT_SECRET not set — leaving the realm's baked-in secret."
+    return
+  fi
+
+  local uuid
+  uuid="$(client_uuid "$client_id")"
+
+  if [ -z "$uuid" ]; then
+    echo "keycloak-config: WARNING — client '$client_id' not found, cannot set secret."
+    return
+  fi
+
+  "$KCADM" update "clients/$uuid" -r "$REALM" -s "secret=${KC_API_CLIENT_SECRET}"
+  echo "keycloak-config: '$client_id' secret set from environment."
+}
+
+configure_redirects appointme-frontend
+configure_redirects appointme-api
+set_api_client_secret
 
 echo "keycloak-config: done."
