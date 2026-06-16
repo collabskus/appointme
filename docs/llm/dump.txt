@@ -1,6 +1,6 @@
 ===============================================================================
 ASP.NET PROJECT EXPORT  (git-tracked files)
-Generated: 06/11/2026 23:03:56
+Generated: 06/16/2026 09:39:36
 Project Path: D:\DEV\personal\appointme
 Excluded:   docs/llm
 ===============================================================================
@@ -51761,7 +51761,7 @@ Output File: D:\DEV\personal\appointme\docs\llm\dump.txt
 
 
 ===============================================================================
-EXPORT COMPLETED: 06/11/2026 23:03:57
+EXPORT COMPLETED: 06/16/2026 09:39:38
 Total Files Exported: 787
 Output File: D:\DEV\personal\appointme\docs\llm\dump.txt
 ===============================================================================
